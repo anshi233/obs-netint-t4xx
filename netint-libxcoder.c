@@ -125,6 +125,42 @@ int (*p_ni_logan_encode_copy_packet_data)(ni_logan_enc_context_t *, uint8_t *, i
 
 /** Receive encoded packet from encoder (non-blocking, returns size if available) */
 int (*p_ni_logan_encode_receive)(ni_logan_enc_context_t *) = NULL;
+
+/** Allocate encoder frame buffer (for device session API) */
+int (*p_ni_logan_encoder_frame_buffer_alloc)(ni_logan_frame_t *, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int, int) = NULL;
+
+/** Free frame buffer */
+int (*p_ni_logan_frame_buffer_free)(ni_logan_frame_t *) = NULL;
+
+/** Copy YUV data to HW format */
+void (*p_ni_logan_copy_hw_yuv420p)(uint8_t *[NI_LOGAN_MAX_NUM_DATA_POINTERS], uint8_t *[NI_LOGAN_MAX_NUM_DATA_POINTERS], int, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS]) = NULL;
+
+/** Device session write (low-level API) */
+int (*p_ni_logan_device_session_write)(ni_logan_session_context_t *, ni_logan_session_data_io_t *, int) = NULL;
+
+/** Device session read (low-level API) */
+int (*p_ni_logan_device_session_read)(ni_logan_session_context_t *, ni_logan_session_data_io_t *, int) = NULL;
+
+/** Open device session */
+int (*p_ni_logan_device_session_open)(ni_logan_session_context_t *, int) = NULL;
+
+/** Close device session */
+int (*p_ni_logan_device_session_close)(ni_logan_session_context_t *, int, int) = NULL;
+
+/** Initialize session context */
+void (*p_ni_logan_device_session_context_init)(ni_logan_session_context_t *) = NULL;
+
+/** Get HW YUV420p dimensions */
+void (*p_ni_logan_get_hw_yuv420p_dim)(int, int, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS]) = NULL;
+
+/** Allocate packet buffer */
+int (*p_ni_logan_packet_buffer_alloc)(ni_logan_packet_t *, int) = NULL;
+
+/** Free packet buffer */
+int (*p_ni_logan_packet_buffer_free)(ni_logan_packet_t *) = NULL;
+
+/** Initialize default encoder parameters */
+int (*p_ni_logan_encoder_init_default_params)(ni_logan_encoder_params_t *, int, int, long, int, int) = NULL;
 /*@}*/
 
 /**
@@ -314,6 +350,24 @@ bool ni_libxcoder_open(void)
     RESOLVE(ni_logan_encode_open);
     RESOLVE(ni_logan_encode_close);
     RESOLVE(ni_logan_encode_header);
+    
+    /* Device session API (lower-level, direct hardware access) */
+    RESOLVE(ni_logan_device_session_context_init);
+    RESOLVE(ni_logan_device_session_open);
+    RESOLVE(ni_logan_device_session_close);
+    RESOLVE(ni_logan_device_session_write);
+    RESOLVE(ni_logan_device_session_read);
+    
+    /* Frame buffer management API */
+    RESOLVE(ni_logan_encoder_frame_buffer_alloc);
+    RESOLVE(ni_logan_frame_buffer_free);
+    RESOLVE(ni_logan_get_hw_yuv420p_dim);
+    RESOLVE(ni_logan_copy_hw_yuv420p);
+    RESOLVE(ni_logan_packet_buffer_alloc);
+    RESOLVE(ni_logan_packet_buffer_free);
+    RESOLVE(ni_logan_encoder_init_default_params);
+    
+    /* High-level encode API (keeping for compatibility, but switching to device session API) */
     RESOLVE(ni_logan_encode_get_frame);
     RESOLVE(ni_logan_encode_reconfig_vfr);
     RESOLVE(ni_logan_encode_copy_frame_data);

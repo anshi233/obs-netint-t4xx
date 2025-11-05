@@ -39,6 +39,26 @@
 
 /** Maximum length of device name string */
 #define NI_LOGAN_MAX_DEVICE_NAME_LEN 32
+
+/** Maximum auxiliary data per frame */
+#define NI_MAX_NUM_AUX_DATA_PER_FRAME 16
+
+/** Maximum transmit/receive buffer size for packets */
+#define NI_LOGAN_MAX_TX_SZ (8 * 1024 * 1024)  /* 8 MB */
+
+/** Return codes */
+#define NI_LOGAN_RETCODE_SUCCESS 0
+#define NI_LOGAN_RETCODE_FAILURE -1
+#define NI_LOGAN_RETCODE_INVALID_PARAM -2
+#define NI_LOGAN_RETCODE_ERROR_MEM_ALOC -3
+
+/** Device types for session open/read/write */
+typedef enum {
+    NI_LOGAN_DEVICE_TYPE_DECODER = 0,
+    NI_LOGAN_DEVICE_TYPE_ENCODER = 1,
+    NI_LOGAN_DEVICE_TYPE_SCALER = 2,
+    NI_LOGAN_DEVICE_TYPE_AI = 3
+} ni_logan_device_type_t;
 /*@}*/
 
 /**
@@ -52,56 +72,135 @@ typedef enum {
 } ni_logan_pix_fmt_t;
 
 /**
- * @brief Forward declaration for frame structure
- * 
- * This is an opaque type - the actual structure is defined in libxcoder.
- * We only need pointers to it, so a forward declaration is sufficient.
+ * @brief Forward declarations for types used in frame/packet structures
  */
-typedef struct _ni_logan_frame ni_logan_frame_t;
+typedef enum { NI_LOGAN_CODEC_FORMAT_H264 = 0, NI_LOGAN_CODEC_FORMAT_H265 = 1 } ni_logan_codec_format_t;
+typedef enum { NI_LOGAN_PIC_TYPE_I = 0, NI_LOGAN_PIC_TYPE_P = 1 } ni_logan_pic_type_t;
+typedef struct _ni_logan_buf ni_logan_buf_t;
+typedef struct _ni_aux_data ni_aux_data_t;
+typedef struct _ni_logan_all_custom_sei ni_logan_all_custom_sei_t;
 
 /**
- * @brief Session data I/O structure - OPAQUE WRAPPER
+ * @brief Frame structure - EXACT copy from ni_device_api_logan.h lines 1387-1480
  * 
- * In the real library, this is a union of ni_logan_frame_t and ni_logan_packet_t,
- * which are both HUGE structs (~400 bytes each).
- * 
- * CRITICAL: We MUST match the library's size EXACTLY or input_data_fifo will be
- * at the wrong offset in ni_logan_enc_context_t!
- * 
- * Library measurements (from runtime logs):
- *   sizeof(ni_logan_session_data_io_t) = 416 bytes
- *   This is embedded in ni_logan_enc_context_t as "output_pkt" field
- * 
- * We use opaque padding to avoid importing the massive frame/packet definitions.
- * 
- * ACCESSING FRAME DATA:
- * The library's actual structure has:
- *   union { ni_logan_frame_t frame; ni_logan_packet_t packet; } data;
- * And ni_logan_frame_t starts with: void *p_data[...];
- * 
- * To access p_data safely, cast to _ni_logan_session_data_io_accessor.
+ * This is the complete structure, not a forward declaration, to ensure correct size.
  */
-typedef struct _ni_logan_session_data_io {
-    uint8_t _opaque_union[416];  /**< Opaque padding matching library union size */
+typedef struct _ni_logan_frame
+{
+  ni_logan_codec_format_t src_codec;
+  long long dts;
+  long long pts;
+  uint32_t end_of_stream;
+  uint32_t start_of_stream;
+  uint32_t video_width;
+  uint32_t video_height;
+  uint32_t video_orig_width;
+  uint32_t video_orig_height;
+
+  uint32_t crop_top;
+  uint32_t crop_bottom;
+  uint32_t crop_left;
+  uint32_t crop_right;
+
+  uint16_t force_headers;
+  uint8_t use_cur_src_as_long_term_pic;
+  uint8_t use_long_term_ref;
+
+  int force_key_frame;
+  ni_logan_pic_type_t ni_logan_pict_type;
+  unsigned int sei_total_len;
+
+  unsigned int sei_cc_offset;
+  unsigned int sei_cc_len;
+  unsigned int sei_hdr_mastering_display_color_vol_offset;
+  unsigned int sei_hdr_mastering_display_color_vol_len;
+  unsigned int sei_hdr_content_light_level_info_offset;
+  unsigned int sei_hdr_content_light_level_info_len;
+  unsigned int sei_hdr_plus_offset;
+  unsigned int sei_hdr_plus_len;
+  unsigned int sei_user_data_unreg_offset;
+  unsigned int sei_user_data_unreg_len;
+  unsigned int sei_alt_transfer_characteristics_offset;
+  unsigned int sei_alt_transfer_characteristics_len;
+  unsigned int vui_offset;
+  unsigned int vui_len;
+
+  unsigned int roi_len;
+  unsigned int reconf_len;
+  unsigned int extra_data_len;
+  uint16_t force_pic_qp;
+  uint32_t frame_chunk_idx;
+
+  void * p_data[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+  uint32_t data_len[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+
+  void* p_buffer;
+  uint32_t buffer_size;
+
+  ni_logan_buf_t *dec_buf;
+  uint8_t preferred_characteristics_data_len;
+
+  uint8_t *p_custom_sei;
+  uint16_t bit_depth;
+  int flags;
+
+  ni_aux_data_t *aux_data[NI_MAX_NUM_AUX_DATA_PER_FRAME];
+  int            nb_aux_data;
+
+  uint8_t  color_primaries;
+  uint8_t  color_trc;
+  uint8_t  color_space;
+  int      video_full_range_flag;
+  uint8_t  aspect_ratio_idc;
+  uint16_t sar_width;
+  uint16_t sar_height;
+  uint32_t vui_num_units_in_tick;
+  uint32_t vui_time_scale;
+  uint8_t separate_metadata;
+} ni_logan_frame_t;
+
+/**
+ * @brief Packet structure - EXACT copy from ni_device_api_logan.h lines 1613-1639
+ */
+typedef struct _ni_logan_packet
+{
+  long long dts;
+  long long pts;
+  long long pos;
+  uint32_t end_of_stream;
+  uint32_t start_of_stream;
+  uint32_t video_width;
+  uint32_t video_height;
+  uint32_t frame_type;
+  int recycle_index;
+
+  void* p_data;
+  uint32_t data_len;
+  int sent_size;
+
+  void* p_buffer;
+  uint32_t buffer_size;
+  uint32_t avg_frame_qp;
+
+  ni_logan_all_custom_sei_t *p_all_custom_sei;
+  int len_of_sei_after_vcl;
+  int flags;
+} ni_logan_packet_t;
+
+/**
+ * @brief Session data I/O structure - EXACT copy from ni_device_api_logan.h lines 1661-1669
+ * 
+ * This is the REAL structure with the actual union, not padding!
+ * Contains union of frame and packet for bidirectional data transfer.
+ */
+typedef struct _ni_logan_session_data_io
+{
+  union
+  {
+    ni_logan_frame_t  frame;
+    ni_logan_packet_t packet;
+  } data;
 } ni_logan_session_data_io_t;
-
-/**
- * @brief Note on accessing frame data from ni_logan_session_data_io_t
- * 
- * The library's actual structure is:
- *   typedef struct { union { ni_logan_frame_t frame; ni_logan_packet_t packet; } data; } ni_logan_session_data_io_t;
- * 
- * Library functions expect: ni_logan_frame_t * (pointer to frame)
- * The frame is the first member of the union, so it starts at offset 0.
- * 
- * To get ni_logan_frame_t * from ni_logan_session_data_io_t *p:
- *   Just cast: (ni_logan_frame_t *)p
- * 
- * This works because:
- *   - Union starts at offset 0 of the struct
- *   - Frame is first member of union (offset 0 from union start)
- *   - Therefore, &p->data.frame == p (same address)
- */
 
 /**
  * @brief Main encoder context structure

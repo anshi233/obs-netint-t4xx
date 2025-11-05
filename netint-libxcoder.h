@@ -28,6 +28,11 @@
 
 #include "netint-libxcoder-shim.h"
 
+/* Forward declarations for new device session API types */
+typedef struct _ni_logan_session_context ni_logan_session_context_t;
+typedef struct _ni_logan_encoder_params ni_logan_encoder_params_t;
+typedef struct _ni_logan_packet ni_logan_packet_t;
+
 /**
  * @brief Open and load libxcoder library, resolving all function symbols
  * 
@@ -94,6 +99,42 @@ extern int (*p_ni_logan_encode_copy_packet_data)(ni_logan_enc_context_t *, uint8
 
 /** Receive encoded packet from encoder (non-blocking) */
 extern int (*p_ni_logan_encode_receive)(ni_logan_enc_context_t *);
+
+/** Allocate encoder frame buffer (for device session API) */
+extern int (*p_ni_logan_encoder_frame_buffer_alloc)(ni_logan_frame_t *, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int, int);
+
+/** Free frame buffer */
+extern int (*p_ni_logan_frame_buffer_free)(ni_logan_frame_t *);
+
+/** Copy YUV data to HW format */
+extern void (*p_ni_logan_copy_hw_yuv420p)(uint8_t *[NI_LOGAN_MAX_NUM_DATA_POINTERS], uint8_t *[NI_LOGAN_MAX_NUM_DATA_POINTERS], int, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS]);
+
+/** Device session write (low-level API) */
+extern int (*p_ni_logan_device_session_write)(ni_logan_session_context_t *, ni_logan_session_data_io_t *, int);
+
+/** Device session read (low-level API) */
+extern int (*p_ni_logan_device_session_read)(ni_logan_session_context_t *, ni_logan_session_data_io_t *, int);
+
+/** Open device session */
+extern int (*p_ni_logan_device_session_open)(ni_logan_session_context_t *, int);
+
+/** Close device session */
+extern int (*p_ni_logan_device_session_close)(ni_logan_session_context_t *, int, int);
+
+/** Initialize session context */
+extern void (*p_ni_logan_device_session_context_init)(ni_logan_session_context_t *);
+
+/** Get HW YUV420p dimensions */
+extern void (*p_ni_logan_get_hw_yuv420p_dim)(int, int, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int[NI_LOGAN_MAX_NUM_DATA_POINTERS]);
+
+/** Allocate packet buffer */
+extern int (*p_ni_logan_packet_buffer_alloc)(ni_logan_packet_t *, int);
+
+/** Free packet buffer */
+extern int (*p_ni_logan_packet_buffer_free)(ni_logan_packet_t *);
+
+/** Initialize default encoder parameters */
+extern int (*p_ni_logan_encoder_init_default_params)(ni_logan_encoder_params_t *, int, int, long, int, int);
 /*@}*/
 
 /**
