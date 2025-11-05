@@ -60,20 +60,48 @@ typedef enum {
 typedef struct _ni_logan_frame ni_logan_frame_t;
 
 /**
- * @brief Session data I/O structure
+ * @brief Session data I/O structure - OPAQUE WRAPPER
  * 
- * This structure is used to pass frame data to and from the encoder.
- * It contains nested structures for accessing the actual frame buffer.
+ * In the real library, this is a union of ni_logan_frame_t and ni_logan_packet_t,
+ * which are both HUGE structs (~400 bytes each).
  * 
- * The structure layout matches libxcoder's internal organization.
+ * CRITICAL: We MUST match the library's size EXACTLY or input_data_fifo will be
+ * at the wrong offset in ni_logan_enc_context_t!
+ * 
+ * Library measurements (from runtime logs):
+ *   sizeof(ni_logan_session_data_io_t) = 416 bytes
+ *   This is embedded in ni_logan_enc_context_t as "output_pkt" field
+ * 
+ * We use opaque padding to avoid importing the massive frame/packet definitions.
+ * 
+ * ACCESSING FRAME DATA:
+ * The library's actual structure has:
+ *   union { ni_logan_frame_t frame; ni_logan_packet_t packet; } data;
+ * And ni_logan_frame_t starts with: void *p_data[...];
+ * 
+ * To access p_data safely, cast to _ni_logan_session_data_io_accessor.
  */
 typedef struct _ni_logan_session_data_io {
-    struct {
-        struct {
-            void *p_data;  /**< Pointer to frame data (cast to ni_logan_frame_t *) */
-        } frame;
-    } data;
+    uint8_t _opaque_union[416];  /**< Opaque padding matching library union size */
 } ni_logan_session_data_io_t;
+
+/**
+ * @brief Note on accessing frame data from ni_logan_session_data_io_t
+ * 
+ * The library's actual structure is:
+ *   typedef struct { union { ni_logan_frame_t frame; ni_logan_packet_t packet; } data; } ni_logan_session_data_io_t;
+ * 
+ * Library functions expect: ni_logan_frame_t * (pointer to frame)
+ * The frame is the first member of the union, so it starts at offset 0.
+ * 
+ * To get ni_logan_frame_t * from ni_logan_session_data_io_t *p:
+ *   Just cast: (ni_logan_frame_t *)p
+ * 
+ * This works because:
+ *   - Union starts at offset 0 of the struct
+ *   - Frame is first member of union (offset 0 from union start)
+ *   - Therefore, &p->data.frame == p (same address)
+ */
 
 /**
  * @brief Main encoder context structure
@@ -170,5 +198,36 @@ typedef struct _ni_logan_enc_context {
     int encoder_flushing; // NI hardware encoder start flushing
     int encoder_eof; // recieved eof from NI hardware encoder
 } ni_logan_enc_context_t;
+
+/*******************************************************************************
+ * COMPILE-TIME STRUCT SIZE VERIFICATION
+ * 
+ * These checks ensure our struct definitions match the library EXACTLY.
+ * Measurements from libxcoder_logan v3.5.1 runtime logs:
+ *   - sizeof(ni_logan_session_data_io_t) = 416 bytes
+ *   - sizeof(ni_logan_enc_context_t) = 688 bytes  
+ *   - offsetof(input_data_fifo) = 544 bytes
+ * 
+ * If compilation fails here, the struct layout is WRONG and must be fixed!
+ ******************************************************************************/
+#ifndef _MSC_VER
+  /* GCC/Clang: Use _Static_assert */
+  _Static_assert(sizeof(ni_logan_session_data_io_t) == 416,
+                 "ni_logan_session_data_io_t size mismatch!");
+  _Static_assert(sizeof(ni_logan_enc_context_t) == 688,
+                 "ni_logan_enc_context_t size mismatch!");
+#else
+  /* MSVC: Use static_assert (C11) or compile-time array check */
+  #if _MSC_VER >= 1600  /* VS2010+ */
+    static_assert(sizeof(ni_logan_session_data_io_t) == 416,
+                  "ni_logan_session_data_io_t size mismatch!");
+    static_assert(sizeof(ni_logan_enc_context_t) == 688,
+                  "ni_logan_enc_context_t size mismatch!");
+  #else
+    /* Fallback for old MSVC: compile-time array trick */
+    typedef char _verify_session_data_io[(sizeof(ni_logan_session_data_io_t)==416)?1:-1];
+    typedef char _verify_enc_context[(sizeof(ni_logan_enc_context_t)==688)?1:-1];
+  #endif
+#endif
 
 

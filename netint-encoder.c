@@ -41,6 +41,7 @@
 
 #include "netint-encoder.h"
 #include "netint-libxcoder.h"
+#include "netint-debug.h"
 
 #include <obs-avc.h>
 #include <obs-hevc.h>
@@ -133,27 +134,23 @@ struct netint_ctx {
     size_t extra_size;                /**< Size of extradata in bytes */
     bool got_headers;                 /**< true if headers were obtained (either during init or from first packet) */
     bool flushing;                    /**< true when encoder is being flushed (no more input frames) */
-    DARRAY(struct netint_pkt) pkt_queue; /**< Thread-safe queue of encoded packets waiting for OBS */
-    pthread_t recv_thread;            /**< Background thread handle for receiving encoded packets */
-    pthread_mutex_t queue_mutex;      /**< Mutex protecting pkt_queue from concurrent access */
-    pthread_mutex_t state_mutex;      /**< Mutex protecting state and error counters */
-    bool stop_thread;                  /**< Flag to signal background thread to stop */
-    bool mutexes_initialized;         /**< Flag indicating if mutexes were initialized (for safe cleanup) */
+    
+    /* Single-threaded design like FFmpeg - no background thread needed */
+    /* The encode() function does synchronous send + receive */
+    
     char *rc_mode;                     /**< Rate control mode: "CBR" or "VBR" */
     char *profile;                      /**< Encoder profile: "baseline", "main", or "high" */
     bool repeat_headers;               /**< If true, attach SPS/PPS to every keyframe */
     int codec_type;                    /**< Codec type: 0 = H.264, 1 = H.265 (HEVC) */
     
     /* Error tracking and health monitoring */
-    netint_encoder_state_t state;      /**< Current encoder state (for health monitoring) */
     int consecutive_errors;            /**< Count of consecutive errors (reset on success) */
     int total_errors;                  /**< Total error count since encoder creation */
-    int recovery_attempts;             /**< Number of recovery attempts made */
-    uint64_t last_packet_time;         /**< Timestamp (os_gettime_ns) of last received packet */
-    uint64_t last_frame_time;          /**< Timestamp (os_gettime_ns) of last frame sent */
     uint64_t encoder_start_time;       /**< Timestamp (os_gettime_ns) when encoder was created */
-    uint64_t last_error_time;          /**< Timestamp (os_gettime_ns) of last error */
-    char last_error_msg[256];          /**< Last error message for debugging */
+    
+#ifdef DEBUG_NETINT_PLUGIN
+    uint32_t debug_magic;             /**< Magic number for validation */
+#endif
 };
 
 /**
@@ -173,189 +170,29 @@ static const char *netint_get_name(void *type_data)
 
 /* Forward declarations */
 static void netint_destroy(void *data);
-static void *netint_recv_thread(void *param);
-static void netint_log_error(struct netint_ctx *ctx, const char *operation, const char *error_msg);
-static bool netint_check_encoder_health(struct netint_ctx *ctx);
-static bool netint_attempt_recovery(struct netint_ctx *ctx);
-static void netint_record_success(struct netint_ctx *ctx);
 
 /**
- * @brief Log error with context and update error tracking
- * 
- * This function logs errors with full context (operation, encoder state, error counts)
- * and updates the encoder's error tracking state. This helps with debugging by providing
- * a complete picture of what went wrong and when.
+ * @brief Simple error logging helper
  * 
  * @param ctx Encoder context
- * @param operation Name of the operation that failed (e.g., "encode_get_frame")
- * @param error_msg Error message describing what went wrong
+ * @param operation Name of the operation that failed
+ * @param ret_code Return code from API
  */
-static void netint_log_error(struct netint_ctx *ctx, const char *operation, const char *error_msg)
+static void netint_log_error(struct netint_ctx *ctx, const char *operation, int ret_code)
 {
     if (!ctx) return;
     
-    pthread_mutex_lock(&ctx->state_mutex);
-    
-    uint64_t now = os_gettime_ns();
     ctx->consecutive_errors++;
     ctx->total_errors++;
-    ctx->last_error_time = now;
     
-    /* Store error message for debugging */
-    snprintf(ctx->last_error_msg, sizeof(ctx->last_error_msg), "%s: %s", operation, error_msg);
+    blog(LOG_ERROR, "[obs-netint-t4xx] %s failed with ret=%d (consecutive: %d, total: %d)",
+          operation, ret_code, ctx->consecutive_errors, ctx->total_errors);
     
-    /* Update state based on error count */
+    /* If too many consecutive errors, warn user */
     if (ctx->consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
-        ctx->state = NETINT_ENCODER_STATE_FAILED;
-        blog(LOG_ERROR, "[obs-netint-t4xx] Encoder FAILED after %d consecutive errors in operation '%s': %s", 
-              ctx->consecutive_errors, operation, error_msg);
-        blog(LOG_ERROR, "[obs-netint-t4xx] Encoder stats: total_errors=%d, recovery_attempts=%d, uptime=%.1fs",
-              ctx->total_errors, ctx->recovery_attempts, 
-              (now - ctx->encoder_start_time) / 1000000000.0);
-    } else {
-        ctx->state = NETINT_ENCODER_STATE_ERROR;
-        blog(LOG_WARNING, "[obs-netint-t4xx] Encoder error in '%s': %s (consecutive: %d/%d, total: %d)",
-              operation, error_msg, ctx->consecutive_errors, MAX_CONSECUTIVE_ERRORS, ctx->total_errors);
+        blog(LOG_ERROR, "[obs-netint-t4xx] Too many consecutive errors (%d), encoder may need recreation",
+              ctx->consecutive_errors);
     }
-    
-    pthread_mutex_unlock(&ctx->state_mutex);
-}
-
-/**
- * @brief Record successful operation and reset error counters
- * 
- * This function is called when an operation succeeds. It resets consecutive error
- * counters and updates the encoder state to normal. This helps distinguish between
- * transient errors and persistent failures.
- * 
- * @param ctx Encoder context
- */
-static void netint_record_success(struct netint_ctx *ctx)
-{
-    if (!ctx) return;
-    
-    pthread_mutex_lock(&ctx->state_mutex);
-    
-    /* Reset consecutive errors on success */
-    if (ctx->consecutive_errors > 0) {
-        blog(LOG_INFO, "[obs-netint-t4xx] Encoder recovered from %d consecutive errors", ctx->consecutive_errors);
-        ctx->consecutive_errors = 0;
-    }
-    
-    /* Update state to normal if we were in error state */
-    if (ctx->state == NETINT_ENCODER_STATE_ERROR || ctx->state == NETINT_ENCODER_STATE_RECOVERING) {
-        ctx->state = NETINT_ENCODER_STATE_NORMAL;
-    }
-    
-    pthread_mutex_unlock(&ctx->state_mutex);
-}
-
-/**
- * @brief Check encoder health and detect hangs
- * 
- * This function monitors the encoder's health by checking:
- * - Time since last packet received
- * - Time since last frame sent
- * - Encoder state
- * 
- * If the encoder appears hung (no packets for too long), it attempts recovery.
- * 
- * @param ctx Encoder context
- * @return true if encoder is healthy, false if hung or failed
- */
-static bool netint_check_encoder_health(struct netint_ctx *ctx)
-{
-    if (!ctx) return false;
-    
-    pthread_mutex_lock(&ctx->state_mutex);
-    
-    /* If already failed, don't check further */
-    if (ctx->state == NETINT_ENCODER_STATE_FAILED) {
-        pthread_mutex_unlock(&ctx->state_mutex);
-        return false;
-    }
-    
-    uint64_t now = os_gettime_ns();
-    bool is_healthy = true;
-    
-    /* Check if encoder is hung (no packets received for too long) */
-    if (!ctx->flushing && ctx->last_packet_time > 0) {
-        uint64_t time_since_packet = (now - ctx->last_packet_time) / 1000000000ULL; /* Convert to seconds */
-        
-        if (time_since_packet >= ENCODER_HANG_TIMEOUT_SEC) {
-            ctx->state = NETINT_ENCODER_STATE_HUNG;
-            blog(LOG_WARNING, "[obs-netint-t4xx] Encoder appears HUNG: no packets for %llu seconds", 
-                  (unsigned long long)time_since_packet);
-            blog(LOG_WARNING, "[obs-netint-t4xx] Last packet: %llu seconds ago, Last frame: %llu seconds ago",
-                  (unsigned long long)time_since_packet,
-                  ctx->last_frame_time > 0 ? (unsigned long long)((now - ctx->last_frame_time) / 1000000000ULL) : 0);
-            is_healthy = false;
-        }
-    }
-    
-    pthread_mutex_unlock(&ctx->state_mutex);
-    
-    /* Attempt recovery if encoder is hung */
-    if (!is_healthy && ctx->state == NETINT_ENCODER_STATE_HUNG) {
-        if (!netint_attempt_recovery(ctx)) {
-            return false;
-        }
-    }
-    
-    return true;
-}
-
-/**
- * @brief Attempt to recover from encoder errors or hang
- * 
- * This function attempts to recover the encoder when it encounters errors or hangs.
- * Recovery strategies:
- * 1. Try to close and reopen encoder connection (if API supports it)
- * 2. Reset encoder state
- * 3. Clear error counters
- * 
- * If recovery fails after MAX_RECOVERY_ATTEMPTS, the encoder is marked as failed.
- * 
- * @param ctx Encoder context
- * @return true if recovery was attempted (may still fail), false if max attempts reached
- */
-static bool netint_attempt_recovery(struct netint_ctx *ctx)
-{
-    if (!ctx) return false;
-    
-    pthread_mutex_lock(&ctx->state_mutex);
-    
-    if (ctx->recovery_attempts >= MAX_RECOVERY_ATTEMPTS) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Max recovery attempts (%d) reached, encoder marked as FAILED", 
-              MAX_RECOVERY_ATTEMPTS);
-        ctx->state = NETINT_ENCODER_STATE_FAILED;
-        pthread_mutex_unlock(&ctx->state_mutex);
-        return false;
-    }
-    
-    ctx->recovery_attempts++;
-    ctx->state = NETINT_ENCODER_STATE_RECOVERING;
-    blog(LOG_INFO, "[obs-netint-t4xx] Attempting encoder recovery (attempt %d/%d)...", 
-          ctx->recovery_attempts, MAX_RECOVERY_ATTEMPTS);
-    
-    pthread_mutex_unlock(&ctx->state_mutex);
-    
-    /* Recovery strategy: Try to reset encoder state */
-    /* Note: libxcoder may not support hot-reconnect, so we log the attempt */
-    /* In a real implementation, we might try to close/reopen the encoder */
-    blog(LOG_INFO, "[obs-netint-t4xx] Recovery: Clearing error counters and resetting state");
-    
-    pthread_mutex_lock(&ctx->state_mutex);
-    ctx->consecutive_errors = 0;
-    ctx->last_error_time = 0;
-    ctx->last_error_msg[0] = '\0';
-    /* Reset packet time to give encoder a fresh start */
-    ctx->last_packet_time = 0;
-    ctx->state = NETINT_ENCODER_STATE_NORMAL;
-    pthread_mutex_unlock(&ctx->state_mutex);
-    
-    blog(LOG_INFO, "[obs-netint-t4xx] Recovery attempt completed, encoder state reset to NORMAL");
-    return true;
 }
 
 /**
@@ -417,24 +254,17 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     struct netint_ctx *ctx = bzalloc(sizeof(*ctx));
     ctx->encoder = encoder;
     
-    /* Initialize dynamic array for packet queue */
-    da_init(ctx->pkt_queue);
-    
-    /* Initialize mutexes for thread-safe access */
-    pthread_mutex_init(&ctx->queue_mutex, NULL);
-    pthread_mutex_init(&ctx->state_mutex, NULL);
-    ctx->mutexes_initialized = true;
-    
-    /* Initialize error tracking and health monitoring */
-    ctx->state = NETINT_ENCODER_STATE_NORMAL;
+    /* Initialize error tracking */
     ctx->consecutive_errors = 0;
     ctx->total_errors = 0;
-    ctx->recovery_attempts = 0;
-    ctx->last_packet_time = 0;
-    ctx->last_frame_time = 0;
     ctx->encoder_start_time = os_gettime_ns();
-    ctx->last_error_time = 0;
-    ctx->last_error_msg[0] = '\0';
+    
+#ifdef DEBUG_NETINT_PLUGIN
+    /* Initialize debug magic for validation - ALWAYS set this! */
+    ctx->debug_magic = NETINT_ENC_CONTEXT_MAGIC;
+    blog(LOG_INFO, "[DEBUG] Encoder context allocated at %p, size=%zu", ctx, sizeof(*ctx));
+    blog(LOG_INFO, "[DEBUG] Debug magic initialized to 0x%08X", ctx->debug_magic);
+#endif
 
     /* Get video output information to determine frame rate and format */
     video_t *video = obs_encoder_video(encoder);
@@ -498,8 +328,13 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     
     /* Keyframe interval: get from settings, or auto-calculate based on frame rate */
     /* Default is 2 seconds worth of frames (ensures regular keyframes for seeking) */
-    int keyint = (int)obs_data_get_int(settings, "keyint");
-    if (keyint <= 0) keyint = (int)(2 * (voi->fps_num / (double)voi->fps_den));
+    int keyint_seconds = (int)obs_data_get_int(settings, "keyint");
+    if (keyint_seconds <= 0) keyint_seconds = 2; /* Default 2 seconds */
+    
+    /* Convert seconds to frames based on framerate */
+    int keyint_frames = (int)(keyint_seconds * (voi->fps_num / (double)voi->fps_den));
+    blog(LOG_INFO, "[obs-netint-t4xx] Keyframe interval: %d seconds = %d frames @ %.2f fps",
+         keyint_seconds, keyint_frames, voi->fps_num / (double)voi->fps_den);
     
     /* Set timebase for timestamps (matches OBS video output timebase) */
     /* timebase = fps_den / fps_num (e.g., 1/30 for 30fps, 1001/30000 for 29.97fps) */
@@ -567,11 +402,56 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
          ctx->enc.dev_xcoder ? ctx->enc.dev_xcoder : "(null)",
          ctx->enc.dev_enc_name ? ctx->enc.dev_enc_name : "(null)",
          ctx->enc.dev_enc_idx);
-    if (p_ni_logan_encode_init(&ctx->enc) < 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize encoder");
+    
+    /* Validate context before API call */
+    NETINT_VALIDATE_ENC_CONTEXT(ctx, "before ni_logan_encode_init");
+    
+#ifdef DEBUG_NETINT_PLUGIN
+    /* Dump enc context memory before init */
+    netint_debug_dump_memory(&ctx->enc, sizeof(ctx->enc), "enc context BEFORE init");
+#endif
+    
+    /* Call with SEH guard to catch crashes */
+    int init_ret = -1;
+    NETINT_SEH_GUARDED_CALL(init_ret = p_ni_logan_encode_init(&ctx->enc), NULL);
+    
+    blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_init returned: %d", init_ret);
+    
+    if (init_ret < 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize encoder (ret=%d)", init_ret);
+        NETINT_LOG_ENCODER_STATE(ctx, "AFTER failed ni_logan_encode_init");
         goto fail;
     }
-    blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_init succeeded");
+    
+    /* CRITICAL CHECK: Verify that init actually allocated internal structures */
+    blog(LOG_INFO, "[obs-netint-t4xx] Verifying encoder initialization...");
+    blog(LOG_INFO, "[obs-netint-t4xx]   p_session_ctx = %p (should NOT be NULL)", ctx->enc.p_session_ctx);
+    blog(LOG_INFO, "[obs-netint-t4xx]   p_encoder_params = %p (should NOT be NULL)", ctx->enc.p_encoder_params);
+    blog(LOG_INFO, "[obs-netint-t4xx]   input_data_fifo = %p (should NOT be NULL)", ctx->enc.input_data_fifo);
+    
+    /* DEBUG: Show struct memory layout */
+    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
+    blog(LOG_INFO, "[obs-netint-t4xx] STRUCT LAYOUT DEBUG:");
+    blog(LOG_INFO, "[obs-netint-t4xx]   &ctx->enc = %p (base address)", &ctx->enc);
+    blog(LOG_INFO, "[obs-netint-t4xx]   &ctx->enc.input_data_fifo = %p (field offset = %zu bytes)", 
+         &ctx->enc.input_data_fifo, (char*)&ctx->enc.input_data_fifo - (char*)&ctx->enc);
+    blog(LOG_INFO, "[obs-netint-t4xx]   sizeof(ni_logan_enc_context_t) in plugin = %zu bytes", sizeof(ctx->enc));
+    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
+    
+    if (!ctx->enc.p_session_ctx || !ctx->enc.p_encoder_params || !ctx->enc.input_data_fifo) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] CRITICAL: ni_logan_encode_init returned success but didn't allocate internal structures!");
+        blog(LOG_ERROR, "[obs-netint-t4xx] This indicates a library initialization failure.");
+        blog(LOG_ERROR, "[obs-netint-t4xx] Check: 1) Is libxcoder_logan.dll the correct version? 2) Are all dependencies present?");
+        NETINT_LOG_ENCODER_STATE(ctx, "AFTER ni_logan_encode_init with NULL internals");
+        goto fail;
+    }
+    
+#ifdef DEBUG_NETINT_PLUGIN
+    /* Dump enc context memory after init */
+    netint_debug_dump_memory(&ctx->enc, sizeof(ctx->enc), "enc context AFTER init");
+#endif
+    
+    blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_init succeeded and allocated internal structures");
     
     /* Set advanced encoder parameters after initial init */
     /* These parameters require the encoder to be initialized first (they modify internal state) */
@@ -585,13 +465,29 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         /* Instead, we always extract headers from the first encoded packet */
         blog(LOG_INFO, "[obs-netint-t4xx] Will extract headers from first encoded packet (GenHdrs disabled)");
         
+        /* Set keyframe interval (GOP size) */
+        /* Try common parameter names: gopPresetIdx, intraPeriod, gopSize, gopNum */
+        char keyint_str[32];
+        snprintf(keyint_str, sizeof(keyint_str), "%d", keyint_frames);
+        
+        /* Try setting with various possible parameter names */
+        /* The library will ignore unknown parameters, so it's safe to try multiple */
+        blog(LOG_INFO, "[obs-netint-t4xx] Setting GOP size to %d frames (trying multiple param names)", keyint_frames);
+        int gop_ret1 = p_ni_logan_encoder_params_set_value(params, "gopPresetIdx", keyint_str, session_ctx);
+        int gop_ret2 = p_ni_logan_encoder_params_set_value(params, "intraPeriod", keyint_str, session_ctx);
+        int gop_ret3 = p_ni_logan_encoder_params_set_value(params, "gopSize", keyint_str, session_ctx);
+        blog(LOG_INFO, "[obs-netint-t4xx] GOP param set results: gopPresetIdx=%d, intraPeriod=%d, gopSize=%d",
+             gop_ret1, gop_ret2, gop_ret3);
+        
         /* Set rate control mode: CBR (constant) or VBR (variable) */
         /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
         if (ctx->rc_mode) {
             if (strcmp(ctx->rc_mode, "CBR") == 0) {
                 p_ni_logan_encoder_params_set_value(params, "cbr", "1", session_ctx);
+                blog(LOG_INFO, "[obs-netint-t4xx] Rate control mode: CBR (constant bitrate)");
             } else {
                 p_ni_logan_encoder_params_set_value(params, "cbr", "0", session_ctx);
+                blog(LOG_INFO, "[obs-netint-t4xx] Rate control mode: VBR (variable bitrate)");
             }
         }
         
@@ -607,18 +503,20 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
                 } else if (strcmp(ctx->profile, "high") == 0) {
                     profile_id_str = "2"; /* HEVC Main 10 profile (10-bit) */
                 }
-            } else {
-                /* H.264 profiles - profile IDs from H.264 spec */
-                if (strcmp(ctx->profile, "baseline") == 0) {
-                    profile_id_str = "66"; /* H.264 Baseline Profile */
-                } else if (strcmp(ctx->profile, "main") == 0) {
-                    profile_id_str = "77"; /* H.264 Main Profile */
-                } else if (strcmp(ctx->profile, "high") == 0) {
-                    profile_id_str = "100"; /* H.264 High Profile */
-                }
+        } else {
+            /* H.264 profiles - libxcoder expects enum values, NOT H.264 spec profile_idc! */
+            /* From library error: 1=baseline, 2=main, 3=extended, 4=high, 5=high10 */
+            if (strcmp(ctx->profile, "baseline") == 0) {
+                profile_id_str = "1"; /* Baseline profile (enum value) */
+            } else if (strcmp(ctx->profile, "main") == 0) {
+                profile_id_str = "2"; /* Main profile (enum value) */
+            } else if (strcmp(ctx->profile, "high") == 0) {
+                profile_id_str = "4"; /* High profile (enum value) */
             }
+        }
             if (profile_id_str) {
                 p_ni_logan_encoder_params_set_value(params, "profile", profile_id_str, session_ctx);
+                blog(LOG_INFO, "[obs-netint-t4xx] Profile set to: %s (ID=%s)", ctx->profile, profile_id_str);
             }
         }
     }
@@ -627,11 +525,19 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     /* This checks for parameter conflicts and applies defaults */
     /* If generate_enc_hdrs is set, this will also generate headers automatically */
     blog(LOG_INFO, "[obs-netint-t4xx] Calling ni_logan_encode_params_parse (will generate headers)...");
-    int parse_ret = p_ni_logan_encode_params_parse(&ctx->enc);
+    
+    /* Validate context before API call */
+    NETINT_VALIDATE_ENC_CONTEXT(ctx, "before ni_logan_encode_params_parse");
+    
+    /* Call with SEH guard to catch crashes */
+    int parse_ret = -1;
+    NETINT_SEH_GUARDED_CALL(parse_ret = p_ni_logan_encode_params_parse(&ctx->enc), NULL);
+    
     blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_params_parse returned: %d", parse_ret);
     
     if (parse_ret < 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to parse encoder parameters (ret=%d)", parse_ret);
+        NETINT_LOG_ENCODER_STATE(ctx, "AFTER failed ni_logan_encode_params_parse");
         goto fail;
     }
     
@@ -665,12 +571,19 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     blog(LOG_INFO, "[obs-netint-t4xx] enc context: width=%d, height=%d, codec_format=%d",
          ctx->enc.width, ctx->enc.height, ctx->enc.codec_format);
     
-    int open_ret = p_ni_logan_encode_open(&ctx->enc);
+    /* Validate context before API call */
+    NETINT_VALIDATE_ENC_CONTEXT(ctx, "before ni_logan_encode_open");
+    
+    /* Call with SEH guard to catch crashes */
+    int open_ret = -1;
+    NETINT_SEH_GUARDED_CALL(open_ret = p_ni_logan_encode_open(&ctx->enc), NULL);
+    
     blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_open returned: %d", open_ret);
     
     if (open_ret < 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to open encoder device (ret=%d)", open_ret);
         blog(LOG_ERROR, "[obs-netint-t4xx] Check: 1) Is init_rsrc_logan.exe running with admin? 2) Is device available? 3) Run ni_rsrc_list_logan.exe to verify");
+        NETINT_LOG_ENCODER_STATE(ctx, "AFTER failed ni_logan_encode_open");
         goto fail;
     }
     
@@ -685,17 +598,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         blog(LOG_INFO, "[obs-netint-t4xx] Headers will be extracted from first encoded packet");
     }
 
-    /* Start background receive thread for asynchronous packet reception */
-    /* This thread continuously polls for encoded packets and queues them */
-    /* This reduces latency by having packets ready when OBS requests them */
-    blog(LOG_INFO, "[obs-netint-t4xx] Creating background receive thread...");
-    ctx->stop_thread = false;
-    if (pthread_create(&ctx->recv_thread, NULL, netint_recv_thread, ctx) != 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to create receive thread");
-        goto fail;
-    }
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread created successfully");
-    blog(LOG_INFO, "[obs-netint-t4xx] Encoder creation complete, returning context to OBS");
+    blog(LOG_INFO, "[obs-netint-t4xx] Encoder creation complete (single-threaded design like FFmpeg)");
     return ctx;
 fail:
     /* Cleanup all allocated resources on any failure */
@@ -730,41 +633,12 @@ static void netint_destroy(void *data)
     
     blog(LOG_INFO, "[obs-netint-t4xx] netint_destroy called");
     
-    /* Signal background thread to stop */
-    ctx->stop_thread = true;
-    
-    /* Wait for background thread to finish */
-    /* This ensures thread has finished accessing shared data before we free it */
-    /* Note: pthread_join will block until thread exits, which should happen quickly
-     * because the thread checks stop_thread flag in its main loop */
-    pthread_t zero_thread = {0};
-    if (pthread_equal(ctx->recv_thread, zero_thread) == 0) {
-	    blog(LOG_INFO, "[obs-netint-t4xx] Joining background thread...");
-	    int join_result = pthread_join(ctx->recv_thread, NULL);
-	    if (join_result != 0) {
-		    blog(LOG_WARNING, "[obs-netint-t4xx] pthread_join failed with error %d", join_result);
-	    }
+#ifdef DEBUG_NETINT_PLUGIN
+    /* Validate magic before destroy */
+    if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
+        blog(LOG_WARNING, "[DEBUG] Invalid context magic in netint_destroy: 0x%08X", ctx->debug_magic);
     }
-    
-    /* Destroy mutexes (no longer needed since thread is stopped) */
-    /* Only destroy mutexes if they were successfully initialized */
-    if (ctx->mutexes_initialized) {
-        blog(LOG_INFO, "[obs-netint-t4xx] Destroying mutexes...");
-        pthread_mutex_destroy(&ctx->queue_mutex);
-        pthread_mutex_destroy(&ctx->state_mutex);
-        blog(LOG_INFO, "[obs-netint-t4xx] Mutexes destroyed successfully");
-    } else {
-        blog(LOG_INFO, "[obs-netint-t4xx] Mutexes not initialized, skipping destroy");
-    }
-    
-    /* Free all queued packets - any packets not yet consumed by OBS */
-    for (size_t i = 0; i < ctx->pkt_queue.num; i++) {
-        struct netint_pkt *p = &ctx->pkt_queue.array[i];
-        if (p->data) bfree(p->data);
-    }
-    
-    /* Free the packet queue array itself */
-    da_free(ctx->pkt_queue);
+#endif
     
     /* Close hardware encoder connection */
     /* Only close if encoder was actually opened (p_session_ctx AND started flag set) */
@@ -810,6 +684,12 @@ static void netint_destroy(void *data)
     /* enc is EMBEDDED in ctx, so it will be freed when ctx is freed */
     /* No need to manually free it */
     
+#ifdef DEBUG_NETINT_PLUGIN
+    /* Clear magic for use-after-free detection */
+    ctx->debug_magic = 0xFEEDFACE;  /* Freed marker */
+    blog(LOG_INFO, "[obs-netint-t4xx] Context %p marked as freed", ctx);
+#endif
+    
     /* Free context structure itself */
     bfree(ctx);
 }
@@ -846,333 +726,207 @@ static bool netint_update(void *data, obs_data_t *settings)
 /**
  * @brief Encode a video frame and/or receive an encoded packet
  * 
- * This is the main encoding function called by OBS Studio for each video frame.
- * It performs two operations:
- * 1. Sends a new frame to hardware encoder (if frame != NULL)
- * 2. Pops an encoded packet from queue (if available) and returns it to OBS
+ * Single-threaded design matching FFmpeg reference implementation.
+ * Each call to this function:
+ * 1. Sends a new frame to hardware (if frame != NULL)
+ * 2. Attempts to receive ONE encoded packet (non-blocking)
+ * 3. Returns packet to OBS if available
  * 
- * Encoding Flow:
- * - Get frame buffer from encoder
- * - Copy frame data from OBS format to encoder buffer
- * - Reconfigure for variable frame rate (if needed)
- * - Send frame to hardware encoder
- * - Pop packet from queue (background thread filled it)
+ * This matches the FFmpeg pattern:
+ * - avcodec_send_frame() → ni_logan_encode_send()
+ * - avcodec_receive_packet() → ni_logan_encode_receive()
+ * - Loop until EAGAIN or packet received
  * 
- * Flushing:
- * - When frame == NULL, encoder is being flushed (no more input)
- * - Set flushing flag, but continue draining queue
- * - Background thread will stop when encoder signals EOF
- * 
- * Threading:
- * - This function runs on main thread (called by OBS)
- * - Background thread (netint_recv_thread) receives packets asynchronously
- * - Queue is protected by mutex for thread-safe access
- * 
- * Packet Metadata:
- * - PTS/DTS: Presentation and decode timestamps (from encoder)
- * - Keyframe flag: Detected by parsing NAL unit header
- * - Priority: Determined by OBS codec parsing functions
- * - Timebase: Matches video output timebase
+ * Thread Safety:
+ * - Single-threaded design (no background thread)
+ * - All API calls from OBS video thread
+ * - No mutex needed (no concurrent access)
  * 
  * @param data Encoder context pointer
  * @param frame Video frame to encode (NULL when flushing)
  * @param packet Output packet structure (filled if packet available)
  * @param received Output flag: true if packet was returned, false if no packet ready
- * @return true on success, false on error (encoder error, not "no packet")
+ * @return true on success, false on error
  */
 static bool netint_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet, bool *received)
 {
     struct netint_ctx *ctx = data;
     *received = false;
 
-    /* Check encoder health before processing */
-    pthread_mutex_lock(&ctx->state_mutex);
-    if (ctx->state == NETINT_ENCODER_STATE_FAILED) {
-        pthread_mutex_unlock(&ctx->state_mutex);
-        blog(LOG_ERROR, "[obs-netint-t4xx] Encode called but encoder is in FAILED state");
+#ifdef DEBUG_NETINT_PLUGIN
+    /* Validate magic number to detect corruption */
+    if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
+        blog(LOG_ERROR, "[DEBUG] Invalid context magic in netint_encode: 0x%08X (expected 0x%08X)", 
+             ctx->debug_magic, NETINT_ENC_CONTEXT_MAGIC);
+        NETINT_DEBUGBREAK();
         return false;
     }
-    pthread_mutex_unlock(&ctx->state_mutex);
+#endif
 
-    if (!frame) {
-        /* Flushing mode: no more input frames, but continue draining queue */
-        /* This happens when stream/recording stops - encoder has pending packets */
-        ctx->flushing = true;
-        /* Continue draining queue even when flushing */
-    } else {
-        /* Update last frame time for health monitoring */
-        pthread_mutex_lock(&ctx->state_mutex);
-        ctx->last_frame_time = os_gettime_ns();
-        pthread_mutex_unlock(&ctx->state_mutex);
-        
-        /* Check encoder health periodically (every 10 frames roughly) */
-        /* Note: This is a global counter, but health checking is lightweight */
-        static int health_check_counter = 0;
-        if (++health_check_counter >= 10) {
-            health_check_counter = 0;
-            if (!netint_check_encoder_health(ctx)) {
-                /* Encoder is hung or failed, return error */
-                /* OBS will handle encoder recreation when this returns false */
-                return false;
-            }
-        }
-        
+    /* Validate context */
+    NETINT_VALIDATE_ENC_CONTEXT(ctx, "netint_encode entry");
+
+    /* STEP 1: Send frame to encoder (if not flushing) */
+    if (frame) {
         /* Get a frame buffer from the encoder for input data */
-        /* This allocates/prepares a buffer in the encoder's internal format */
-        if (p_ni_logan_encode_get_frame(&ctx->enc) < 0) {
-            netint_log_error(ctx, "encode_get_frame", "Failed to get frame buffer from encoder");
+        int get_frame_ret = -1;
+        NETINT_SEH_GUARDED_CALL(get_frame_ret = p_ni_logan_encode_get_frame(&ctx->enc), false);
+        
+        if (get_frame_ret < 0) {
+            netint_log_error(ctx, "ni_logan_encode_get_frame", get_frame_ret);
             return false;
         }
 
         /* Get pointer to encoder's frame buffer structure */
-        ni_logan_frame_t *ni_frame = (ni_logan_frame_t *)ctx->enc.p_input_fme->data.frame.p_data;
+        /* The library's p_input_fme is actually: struct { union { ni_logan_frame_t frame; ... } data; } */
+        /* Library expects: ni_logan_frame_t * = &p_input_fme->data.frame */
+        /* Since data.frame is at offset 0, this is the same as casting p_input_fme directly */
+        ni_logan_frame_t *ni_frame = (ni_logan_frame_t *)ctx->enc.p_input_fme;
+        
+        /* Validate frame pointer */
+        NETINT_CHECK_NULL(ni_frame, "ni_frame", "after encode_get_frame");
         
         /* Prepare plane pointers and line sizes for YUV420P format */
-        /* planes[0] = Y plane, planes[1] = U plane, planes[2] = V plane */
         uint8_t *planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {frame->data[0], frame->data[1], frame->data[2], NULL};
         int linesize[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {frame->linesize[0], frame->linesize[1], frame->linesize[2], 0};
 
         /* Reconfigure encoder for variable frame rate (VFR) if needed */
-        /* This adjusts encoder timing based on actual frame PTS */
-        p_ni_logan_encode_reconfig_vfr(&ctx->enc, ni_frame, frame->pts);
+        NETINT_SEH_GUARDED_CALL(p_ni_logan_encode_reconfig_vfr(&ctx->enc, ni_frame, frame->pts), false);
 
         /* Copy frame data from OBS format to encoder's frame buffer */
-        /* This copies Y, U, V planes with their respective line sizes */
-        if (p_ni_logan_encode_copy_frame_data(&ctx->enc, ni_frame, planes, linesize) < 0) {
-            netint_log_error(ctx, "encode_copy_frame_data", "Failed to copy frame data to encoder buffer");
+        int copy_ret = -1;
+        NETINT_SEH_GUARDED_CALL(copy_ret = p_ni_logan_encode_copy_frame_data(&ctx->enc, ni_frame, planes, linesize), false);
+        
+        if (copy_ret < 0) {
+            netint_log_error(ctx, "ni_logan_encode_copy_frame_data", copy_ret);
             return false;
         }
 
-        /* Send frame to hardware encoder - triggers actual encoding */
-        /* Hardware will encode asynchronously, packet will be available later */
-        if (p_ni_logan_encode_send(&ctx->enc) < 0) {
-            netint_log_error(ctx, "encode_send", "Failed to send frame to hardware encoder");
+        /* Send frame to hardware encoder */
+        int send_ret = -1;
+        NETINT_SEH_GUARDED_CALL(send_ret = p_ni_logan_encode_send(&ctx->enc), false);
+        
+        if (send_ret < 0) {
+            netint_log_error(ctx, "ni_logan_encode_send", send_ret);
             return false;
         }
         
-        /* Frame sent successfully - record success to reset error counters */
-        netint_record_success(ctx);
+        blog(LOG_DEBUG, "[obs-netint-t4xx] Frame sent successfully (PTS=%lld)", (long long)frame->pts);
+    } else {
+        /* Flushing mode: no more input frames */
+        ctx->flushing = true;
+        blog(LOG_DEBUG, "[obs-netint-t4xx] Flushing encoder (no more frames)");
     }
 
-    /* Background thread handles receive, we just pop from queue */
-    /* Lock mutex to safely access queue */
-    pthread_mutex_lock(&ctx->queue_mutex);
-    if (ctx->pkt_queue.num) {
-        /* Get first packet from queue (FIFO order) */
-        struct netint_pkt pkt = ctx->pkt_queue.array[0];
+    /* STEP 2: Try to receive encoded packet (non-blocking) */
+    /* This is called SAME THREAD as send, following FFmpeg pattern */
+    int got = -1;
+    NETINT_SEH_GUARDED_CALL(got = p_ni_logan_encode_receive(&ctx->enc), false);
+    
+    blog(LOG_DEBUG, "[obs-netint-t4xx] ni_logan_encode_receive returned: %d", got);
+    
+    if (got > 0) {
+        /* Packet is available - allocate buffer for it */
+        uint8_t *buf = bmalloc((size_t)got);
+        if (!buf) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate packet buffer (%d bytes)", got);
+            return false;
+        }
         
-        /* Fill OBS packet structure with queued packet data */
-        packet->data = pkt.data;
-        packet->size = pkt.size;
+        /* Determine if this is the first packet */
+        int first = ctx->enc.firstPktArrived ? 0 : 1;
+        
+        /* Copy packet data from encoder's internal buffer to our buffer */
+        int copy_pkt_ret = -1;
+        NETINT_SEH_GUARDED_CALL(copy_pkt_ret = p_ni_logan_encode_copy_packet_data(&ctx->enc, buf, first, 0), false);
+        
+        if (copy_pkt_ret != 0) {
+            /* Copy failed - free buffer */
+            bfree(buf);
+            blog(LOG_WARNING, "[obs-netint-t4xx] Failed to copy packet data (ret=%d)", copy_pkt_ret);
+            return true; /* Not a fatal error, try again next frame */
+        }
+        
+        /* Mark that first packet has arrived */
+        ctx->enc.firstPktArrived = 1;
+        
+        /* Extract headers from first packet if not already obtained during init */
+        if (first && !ctx->got_headers) {
+            blog(LOG_INFO, "[obs-netint-t4xx] First packet received, extracting headers (size=%d)...", got);
+            
+            /* Free any existing extradata */
+            if (ctx->extra) {
+                bfree(ctx->extra);
+                ctx->extra = NULL;
+                ctx->extra_size = 0;
+            }
+            
+            /* Copy entire first packet as headers (contains SPS/PPS/VPS) */
+            ctx->extra = bmemdup(buf, (size_t)got);
+            ctx->extra_size = (size_t)got;
+            ctx->got_headers = true;
+            
+            blog(LOG_INFO, "[obs-netint-t4xx] Headers extracted from first packet: %zu bytes", ctx->extra_size);
+        }
+        
+        /* Fill OBS packet structure */
+        packet->data = buf;
+        packet->size = (size_t)got;
         packet->type = OBS_ENCODER_VIDEO;
-        packet->pts = pkt.pts;
-        packet->dts = pkt.dts;
         
-        /* Get timebase from video output (matches original frame rate) */
+        /* Set timestamps - use latest_dts if available, otherwise first_frame_pts */
+        packet->pts = ctx->enc.latest_dts != 0 ? ctx->enc.latest_dts : ctx->enc.first_frame_pts;
+        packet->dts = packet->pts; /* For now, PTS and DTS are the same */
+        
+        /* Get timebase from video output */
         video_t *video = obs_encoder_video(ctx->encoder);
         const struct video_output_info *voi = video_output_get_info(video);
         packet->timebase_num = (int32_t)voi->fps_den;
         packet->timebase_den = (int32_t)voi->fps_num;
         
-        /* Set keyframe flag and priority (determined during packet parsing) */
-        packet->keyframe = pkt.keyframe;
-        packet->priority = pkt.priority;
+        /* Parse packet to determine keyframe and priority based on codec type */
+        if (ctx->codec_type == 1) {
+            /* H.265 (HEVC) parsing */
+            packet->keyframe = obs_hevc_keyframe(packet->data, packet->size);
+            packet->priority = obs_parse_hevc_packet_priority(packet);
+        } else {
+            /* H.264 parsing */
+            packet->keyframe = obs_avc_keyframe(packet->data, packet->size);
+            packet->priority = obs_parse_avc_packet_priority(packet);
+        }
+        
         *received = true;
         
-        /* Update last packet time for health monitoring */
-        pthread_mutex_lock(&ctx->state_mutex);
-        ctx->last_packet_time = os_gettime_ns();
-        pthread_mutex_unlock(&ctx->state_mutex);
+        /* Reset consecutive errors on success */
+        if (ctx->consecutive_errors > 0) {
+            blog(LOG_INFO, "[obs-netint-t4xx] Encoder recovered from %d consecutive errors", 
+                  ctx->consecutive_errors);
+            ctx->consecutive_errors = 0;
+        }
         
-        /* Record success - packet received successfully */
-        netint_record_success(ctx);
-        
-        /* Remove packet from queue by shifting remaining packets */
-        /* This is O(n) but queue is typically small (1-2 packets) */
-        memmove(&ctx->pkt_queue.array[0], &ctx->pkt_queue.array[1], (ctx->pkt_queue.num - 1) * sizeof(pkt));
-        ctx->pkt_queue.num--;
+        blog(LOG_DEBUG, "[obs-netint-t4xx] Packet received: size=%zu, pts=%lld, keyframe=%d", 
+              packet->size, (long long)packet->pts, packet->keyframe);
+    } else if (got < 0) {
+        /* Error or EOF from encoder */
+        if (ctx->enc.encoder_eof) {
+            blog(LOG_INFO, "[obs-netint-t4xx] Encoder EOF reached during flush");
+            return true; /* EOF is not an error */
+        } else {
+            /* Actual error */
+            blog(LOG_WARNING, "[obs-netint-t4xx] encode_receive returned error %d", got);
+            netint_log_error(ctx, "ni_logan_encode_receive", got);
+            
+            /* Return false only if too many consecutive errors */
+            if (ctx->consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+                return false;
+            }
+        }
     }
-    pthread_mutex_unlock(&ctx->queue_mutex);
+    /* got == 0: No packet ready yet, this is normal */
 
     return true;
 }
 
-/**
- * @brief Background thread function for receiving encoded packets asynchronously
- * 
- * This thread continuously polls the hardware encoder for encoded packets and queues them.
- * Running this in a separate thread reduces latency because:
- * - Packets are ready when OBS requests them (no waiting for encoding)
- * - Encoding happens in parallel with other OBS operations
- * - Better CPU utilization (doesn't block main encoding thread)
- * 
- * Thread Lifecycle:
- * - Started in netint_create() before encoder is returned
- * - Runs until stop_thread flag is set (in netint_destroy())
- * - Exits when encoder signals EOF (end of stream) or stop_thread is true
- * 
- * Packet Reception:
- * - Polls encoder with ni_logan_encode_receive() (non-blocking)
- * - Allocates buffer for packet data
- * - Copies packet data from encoder buffer
- * - Parses packet to determine keyframe and priority
- * - Queues packet for main thread to consume
- * 
- * Error Handling:
- * - If buffer allocation fails, sleep briefly and retry
- * - If copy fails, free buffer and continue
- * - If encoder signals EOF, exit thread gracefully
- * 
- * Thread Safety:
- * - Queue access is protected by queue_mutex
- * - All queue operations are locked
- * - Main thread (netint_encode) also locks when accessing queue
- * 
- * @param param Pointer to encoder context (netint_ctx structure)
- * @return NULL (thread exit value, not used)
- */
-static void *netint_recv_thread(void *param)
-{
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread: ENTRY POINT");
-    struct netint_ctx *ctx = param;
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread: ctx pointer = %p", ctx);
-    
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread started, entering main loop");
-    
-    /* Main receive loop - runs until encoder is destroyed or EOF */
-    while (!ctx->stop_thread) {
-        /* Poll encoder for encoded packet - non-blocking call */
-        /* Returns: >0 = packet size, 0 = no packet ready, <0 = error or EOF */
-        blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: calling ni_logan_encode_receive...");
-        int got = p_ni_logan_encode_receive(&ctx->enc);
-        blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: ni_logan_encode_receive returned %d", got);
-        
-        if (got > 0) {
-            /* Packet is available - allocate buffer for it */
-            uint8_t *buf = bmalloc((size_t)got);
-            if (!buf) {
-                /* Allocation failed - sleep briefly and retry */
-                /* This shouldn't happen often, but handles memory pressure */
-                os_sleep_ms(10);
-                continue;
-            }
-            
-            /* Determine if this is the first packet (needs special handling) */
-            /* First packet flag affects how packet data is copied */
-            int first = ctx->enc.firstPktArrived ? 0 : 1;
-            
-            /* Copy packet data from encoder's internal buffer to our buffer */
-            if (p_ni_logan_encode_copy_packet_data(&ctx->enc, buf, first, 0) == 0) {
-                /* Mark that first packet has arrived (for future packets) */
-                ctx->enc.firstPktArrived = 1;
-                
-                /* Extract headers from first packet if not already obtained during init */
-                /* The first packet from the encoder always contains SPS/PPS/VPS headers */
-                /* These are needed for stream initialization (decoders need them to start) */
-                if (first && !ctx->got_headers) {
-                    blog(LOG_INFO, "[obs-netint-t4xx] First packet received, extracting headers (size=%d)...", got);
-                    
-                    /* Free any existing extradata (shouldn't happen, but be safe) */
-                    if (ctx->extra) {
-                        bfree(ctx->extra);
-                        ctx->extra = NULL;
-                        ctx->extra_size = 0;
-                    }
-                    
-                    /* Copy entire first packet as headers */
-                    /* For H.264/H.265, the first packet contains SPS/PPS/VPS NAL units */
-                    ctx->extra = bmemdup(buf, (size_t)got);
-                    ctx->extra_size = (size_t)got;
-                    ctx->got_headers = true;
-                    
-                    blog(LOG_INFO, "[obs-netint-t4xx] Headers extracted from first packet: %zu bytes", ctx->extra_size);
-                    
-                    /* NOTE: Do NOT free/reallocate ctx->enc.extradata - it's managed by libxcoder! */
-                    /* Cross-DLL memory management causes heap corruption on Windows */
-                    /* The encoder library will manage its own extradata pointer */
-                }
-                
-                /* Create packet structure with metadata */
-                struct netint_pkt pkt = {0};
-                pkt.data = buf;
-                pkt.size = (size_t)got;
-                
-                /* Set timestamps - use latest_dts if available, otherwise first_frame_pts */
-                /* DTS (decode timestamp) is when frame should be decoded */
-                pkt.pts = ctx->enc.latest_dts != 0 ? ctx->enc.latest_dts : ctx->enc.first_frame_pts;
-                pkt.dts = pkt.pts; /* For now, PTS and DTS are the same */
-                
-                /* Parse packet to determine keyframe and priority based on codec type */
-                /* Keyframe detection: examines NAL unit header (H.264) or NAL unit type (H.265) */
-                /* Priority: determines packet importance for streaming (SPS/PPS = highest priority) */
-                if (ctx->codec_type == 1) {
-                    /* H.265 (HEVC) parsing */
-                    pkt.keyframe = obs_hevc_keyframe(pkt.data, pkt.size);
-                    struct encoder_packet tmp = {0};
-                    tmp.data = pkt.data;
-                    tmp.size = pkt.size;
-                    pkt.priority = obs_parse_hevc_packet_priority(&tmp);
-                } else {
-                    /* H.264 parsing */
-                    pkt.keyframe = obs_avc_keyframe(pkt.data, pkt.size);
-                    struct encoder_packet tmp = {0};
-                    tmp.data = pkt.data;
-                    tmp.size = pkt.size;
-                    pkt.priority = obs_parse_avc_packet_priority(&tmp);
-                }
-                
-                /* Queue packet for main thread to consume */
-                /* Lock mutex to safely add to queue */
-                pthread_mutex_lock(&ctx->queue_mutex);
-                
-                /* Check queue size limit to prevent unbounded growth */
-                if (ctx->pkt_queue.num >= MAX_PKT_QUEUE_SIZE) {
-                    /* Queue is full - log warning but still add packet */
-                    /* In the future, we could drop oldest packet, but for now just warn */
-                    blog(LOG_WARNING, "[obs-netint-t4xx] Packet queue full (%zu packets), OBS may not be consuming fast enough", ctx->pkt_queue.num);
-                }
-                
-                da_push_back(ctx->pkt_queue, &pkt);
-                pthread_mutex_unlock(&ctx->queue_mutex);
-            } else {
-                /* Copy failed - free buffer and continue */
-                /* This shouldn't happen often, but handles encoder errors gracefully */
-                bfree(buf);
-            }
-            continue;
-        } else if (got < 0) {
-            /* Error or EOF from encoder */
-            blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: got < 0, encoder_eof=%d", ctx->enc.encoder_eof);
-            if (ctx->enc.encoder_eof) {
-                /* Encoder signaled EOF (end of stream) - stop receiving */
-                /* This happens when encoder is flushed and all packets are drained */
-                blog(LOG_INFO, "[obs-netint-t4xx] Encoder EOF received, stopping receive thread");
-                break;
-            } else {
-                /* Actual error from encoder */
-                /* Log error but don't exit thread - continue trying */
-                blog(LOG_WARNING, "[obs-netint-t4xx] encode_receive returned error %d, continuing...", got);
-                
-                /* Check if we should give up after too many errors */
-                pthread_mutex_lock(&ctx->state_mutex);
-                if (ctx->consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
-                    blog(LOG_ERROR, "[obs-netint-t4xx] Too many errors in receive thread, exiting");
-                    pthread_mutex_unlock(&ctx->state_mutex);
-                    break;
-                }
-                pthread_mutex_unlock(&ctx->state_mutex);
-            }
-        }
-        
-        /* No packet ready - sleep briefly to avoid busy-waiting */
-        /* 2ms sleep balances responsiveness with CPU usage */
-        blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: no packet ready, sleeping 2ms");
-        os_sleep_ms(2);
-    }
-    
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread exiting normally");
-    return NULL;
-}
 
 /**
  * @brief Set default values for encoder settings
