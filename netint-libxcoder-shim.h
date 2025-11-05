@@ -87,83 +87,88 @@ typedef struct _ni_logan_session_data_io {
  * Note: Some fields are set by libxcoder internally and should not be modified
  * directly. Only fields documented as "input" should be set by our code.
  */
+/**
+ * @brief Forward declaration for FIFO buffer type
+ */
+typedef struct _ni_logan_fifo_buffer ni_logan_fifo_buffer_t;
+
+/**
+ * @brief Main encoder context - EXACT copy from ni_enc_api_logan.h lines 42-114
+ * 
+ * IMPORTANT: This struct definition MUST match the library exactly!
+ * Any deviation causes struct layout corruption and crashes.
+ */
 typedef struct _ni_logan_enc_context {
-    /* Device selection fields */
-    char *dev_xcoder;        /**< Device identifier (legacy, may be unused) */
-    int  dev_enc_idx;        /**< Encoder device index (if using index instead of name) */
-    char *dev_enc_name;      /**< Encoder device name (e.g., "/dev/ni_encoder0") - INPUT */
-    int  keep_alive_timeout; /**< Keep-alive timeout in seconds */
-    int  set_high_priority;  /**< Set high priority for encoder process */
+    char *dev_xcoder;         /* from the user command, which device allocation method we use */
+    int  dev_enc_idx;         /* index of the decoder on the xcoder card */
+    char *dev_enc_name;       /* dev name of the xcoder card to use */
+    int  keep_alive_timeout;  /* keep alive timeout setting */
+    int  set_high_priority;   /*set_high_priority*/
 
-    /* Timing and frame rate */
-    int timebase_num;        /**< Timebase numerator (fps denominator) - INPUT */
-    int timebase_den;        /**< Timebase denominator (fps numerator) - INPUT */
-    int ticks_per_frame;    /**< Ticks per frame (usually 1) - INPUT */
-    int64_t bit_rate;       /**< Target bitrate in bits per second - INPUT */
+    int timebase_num;
+    int timebase_den;
+    int ticks_per_frame;
+    int64_t bit_rate;
+    int width;
+    int height;
+    int ff_log_level; /* ffmpeg log level */
+    int codec_format;
+    int pix_fmt;
 
-    /* Video parameters */
-    int width;              /**< Video width in pixels - INPUT */
-    int height;             /**< Video height in pixels - INPUT */
-    int ff_log_level;       /**< FFmpeg log level (for debugging) */
-    int codec_format;       /**< Codec format: 0=H.264, 1=H.265 - INPUT */
-    int pix_fmt;            /**< Pixel format (NI_LOGAN_PIX_FMT_YUV420P) - INPUT */
+    // color metrics
+    int color_primaries;
+    int color_trc;
+    int color_space;
+    int color_range;
 
-    /* Color space parameters */
-    int color_primaries;    /**< Color primaries (BT.709, BT.2020, etc.) */
-    int color_trc;          /**< Color transfer characteristics */
-    int color_space;        /**< Color space (YUV, RGB, etc.) */
-    int color_range;        /**< Color range (limited/full) */
+    // sample_aspect_ratio
+    int sar_num;
+    int sar_den;
 
-    /* Aspect ratio */
-    int sar_num;            /**< Sample aspect ratio numerator */
-    int sar_den;            /**< Sample aspect ratio denominator */
+    void *p_session_ctx;  /* ni_logan_session_context_t */
+    void *p_encoder_params; /* ni_logan_encoder_params_t */
+    ni_logan_session_data_io_t *p_input_fme; /* used for sending raw data to xcoder */
+    ni_logan_session_data_io_t  output_pkt; /* used for receiving bitstream from xcoder */
+    ni_logan_fifo_buffer_t *input_data_fifo;
 
-    /* Internal state (set by libxcoder) */
-    void *p_session_ctx;                    /**< Session context (opaque, set by libxcoder) */
-    void *p_encoder_params;                 /**< Encoder parameters (opaque, set by libxcoder) */
-    ni_logan_session_data_io_t *p_input_fme; /**< Input frame buffer (set by libxcoder) */
-    ni_logan_session_data_io_t  output_pkt;  /**< Output packet buffer (set by libxcoder) */
-    void *input_data_fifo;                   /**< Input data FIFO (internal) - Compatible with ni_logan_fifo_buffer_t * in v3.5.1 */
+    /* Variables that need to be initialized */
+    int started;
+    uint8_t *p_spsPpsHdr;
+    int spsPpsHdrLen;
+    int spsPpsAttach; /* Attach SPS&PPS to Packet */
+    int spsPpsArrived;
+    int firstPktArrived; /* specially treat first pkt of the encoded bitstream */
+    int dts_offset;
+    int reconfigCount; /* count of reconfig */
+    uint64_t total_frames_received;
+    int64_t first_frame_pts;
+    int64_t latest_dts;
 
-    /* Encoding state flags */
-    int started;                    /**< Encoder has started (set by libxcoder) */
-    uint8_t *p_spsPpsHdr;          /**< SPS/PPS header data (set by libxcoder) */
-    int spsPpsHdrLen;              /**< SPS/PPS header length (set by libxcoder) */
-    int spsPpsAttach;              /**< Attach SPS/PPS to keyframes - INPUT */
-    int spsPpsArrived;             /**< SPS/PPS headers have arrived (set by libxcoder) */
-    int firstPktArrived;            /**< First packet has arrived (set by libxcoder) */
-    int dts_offset;                /**< DTS offset (set by libxcoder) */
-    int reconfigCount;              /**< Reconfiguration count (set by libxcoder) */
-    uint64_t total_frames_received; /**< Total frames received (set by libxcoder) */
-    int64_t first_frame_pts;        /**< PTS of first frame (set by libxcoder) */
-    int64_t latest_dts;             /**< Latest DTS (set by libxcoder) */
+    // original ConformanceWindowOffsets
+    int orig_conf_win_top;   /*!*< A conformance window size of TOP */
+    int orig_conf_win_bottom;   /*!*< A conformance window size of BOTTOM */
+    int orig_conf_win_left;  /*!*< A conformance window size of LEFT */
+    int orig_conf_win_right; /*!*< A conformance window size of RIGHT */
 
-    /* Configuration window (cropping) */
-    int orig_conf_win_top;    /**< Original configuration window top */
-    int orig_conf_win_bottom; /**< Original configuration window bottom */
-    int orig_conf_win_left;   /**< Original configuration window left */
-    int orig_conf_win_right;  /**< Original configuration window right */
+    // to generate encoded bitstream headers
+    uint8_t *extradata;
+    int extradata_size;
 
-    /* Extradata (SPS/PPS headers) */
-    uint8_t *extradata;       /**< Extradata buffer (set by libxcoder after encode_header) */
-    int extradata_size;       /**< Extradata size in bytes (set by libxcoder) */
+    // low delay mode flags
+    int gotPacket; /* used to stop receiving packets when a packet is already received */
+    int sentFrame; /* used to continue receiving packets when a frame is sent and a packet is not yet received */
 
-    /* Status flags */
-    int gotPacket;            /**< Got a packet (set by libxcoder) */
-    int sentFrame;            /**< Sent a frame (set by libxcoder) */
+    // sync framerate
+    int fps_number;
+    int fps_denominator;
 
-    /* Frame rate (may be set by libxcoder) */
-    int fps_number;           /**< FPS numerator */
-    int fps_denominator;       /**< FPS denominator */
-
-    /* Actual device info (set by libxcoder after opening) */
-    int  actual_dev_enc_idx;   /**< Actual device index used (set by libxcoder) */
-    char *actual_dev_name;     /**< Actual device name used (set by libxcoder) */
-
-    /* End-of-stream flags */
-    int eos_fme_received;      /**< End-of-stream frame received (set by libxcoder) */
-    int encoder_flushing;      /**< Encoder is flushing (set by libxcoder) */
-    int encoder_eof;           /**< Encoder has reached end-of-file (set by libxcoder) */
+    /* actual device index/name of encoder after opened */
+    int  actual_dev_enc_idx;
+    char *actual_dev_name;
+    
+    int eos_fme_received; // received the eos frame from the ffmpeg interface
+    int encoder_flushing; // NI hardware encoder start flushing
+    int encoder_eof; // recieved eof from NI hardware encoder
 } ni_logan_enc_context_t;
 
 

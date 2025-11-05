@@ -128,9 +128,10 @@ typedef enum {
 
 struct netint_ctx {
     obs_encoder_t *encoder;           /**< OBS encoder handle (for accessing video info, etc.) */
-    ni_logan_enc_context_t enc;       /**< NETINT libxcoder encoder context (hardware state) */
+    ni_logan_enc_context_t enc;       /**< NETINT libxcoder encoder context (hardware state) - EMBEDDED like FFmpeg does */
     uint8_t *extra;                   /**< SPS/PPS header data (extradata) for stream initialization */
     size_t extra_size;                /**< Size of extradata in bytes */
+    bool got_headers;                 /**< true if headers were obtained (either during init or from first packet) */
     bool flushing;                    /**< true when encoder is being flushed (no more input frames) */
     DARRAY(struct netint_pkt) pkt_queue; /**< Thread-safe queue of encoded packets waiting for OBS */
     pthread_t recv_thread;            /**< Background thread handle for receiving encoded packets */
@@ -439,17 +440,17 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     video_t *video = obs_encoder_video(encoder);
     const struct video_output_info *voi = video_output_get_info(video);
 
-    /* Zero-initialize encoder context structure */
+    /* Zero-initialize encoder context structure (EMBEDDED, not allocated) */
     memset(&ctx->enc, 0, sizeof(ctx->enc));
     
-    /* Initialize device fields early to prevent crashes in libxcoder (required, cannot be NULL) */
-    /* Use specific device path instead of auto-selection to bypass resource manager issues */
-    /* On Windows, the device is at \\.\PHYSICALDRIVE2 with H/W ID 1 for encoder */
-    ctx->enc.dev_xcoder = (char *)bstrdup("\\\\.\\PHYSICALDRIVE2");
-    ctx->enc.dev_enc_name = (char *)bstrdup("\\\\.\\PHYSICALDRIVE2");
+    /* Set basic encoder parameters */
     ctx->enc.dev_enc_idx = 1;  /* H/W ID 1 = encoder (H/W ID 0 = decoder) */
     ctx->enc.keep_alive_timeout = 3;  /* Default timeout in seconds */
     ctx->enc.set_high_priority = 0;   /* Don't set high priority by default */
+    
+    /* IMPORTANT: dev_xcoder MUST be set before calling ni_logan_encode_init! */
+    /* The init function calls strcmp() on dev_xcoder, which crashes if NULL */
+    ctx->enc.dev_xcoder = (char *)bstrdup("");  /* Empty string initially */
     
     /* Set basic video parameters from OBS encoder */
     ctx->enc.width = (int)obs_encoder_get_width(encoder);
@@ -462,24 +463,37 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     const char *dev_name = obs_data_get_string(settings, "device");
     if (dev_name && *dev_name) {
         /* User specified a device name - use it directly */
+        blog(LOG_INFO, "[obs-netint-t4xx] Using device from USER SETTINGS: '%s'", dev_name);
         bfree(ctx->enc.dev_enc_name);
         bfree(ctx->enc.dev_xcoder);
         ctx->enc.dev_enc_name = (char *)bstrdup(dev_name);
         ctx->enc.dev_xcoder = (char *)bstrdup(dev_name);
     } else if (p_ni_logan_rsrc_init && p_ni_logan_rsrc_get_local_device_list) {
         /* No device specified - try to discover available devices */
+        blog(LOG_INFO, "[obs-netint-t4xx] No device in settings, attempting AUTO-DISCOVERY...");
         /* Initialize resource management system (should_match_rev=0, timeout=1s) */
-        if (p_ni_logan_rsrc_init(0, 1) == 0) {
+        /* Accept both SUCCESS (0) and INIT_ALREADY (0x7FFFFFFF) as success */
+        int rsrc_ret = p_ni_logan_rsrc_init(0, 1);
+        blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_rsrc_init returned: %d (0x%X)", rsrc_ret, rsrc_ret);
+        if (rsrc_ret == 0 || rsrc_ret == 0x7FFFFFFF) {
             char names[16][NI_LOGAN_MAX_DEVICE_NAME_LEN] = {0};
             int n = p_ni_logan_rsrc_get_local_device_list(names, 16);
+            blog(LOG_INFO, "[obs-netint-t4xx] Found %d device(s) via auto-discovery", n);
             if (n > 0) {
                 /* Use the first available device */
+                blog(LOG_INFO, "[obs-netint-t4xx] AUTO-DETECTED device: '%s'", names[0]);
                 bfree(ctx->enc.dev_enc_name);
                 bfree(ctx->enc.dev_xcoder);
                 ctx->enc.dev_enc_name = (char *)bstrdup(names[0]);
                 ctx->enc.dev_xcoder = (char *)bstrdup(names[0]);
+            } else {
+                blog(LOG_WARNING, "[obs-netint-t4xx] Auto-discovery found 0 devices, encoder will use default device");
             }
+        } else {
+            blog(LOG_WARNING, "[obs-netint-t4xx] Resource init failed (ret=%d), cannot auto-discover devices", rsrc_ret);
         }
+    } else {
+        blog(LOG_INFO, "[obs-netint-t4xx] Device discovery APIs not available, encoder will use default device");
     }
     
     /* Keyframe interval: get from settings, or auto-calculate based on frame rate */
@@ -522,6 +536,16 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     /* YUV420P = Planar YUV 4:2:0 (separate Y, U, V planes) */
     ctx->enc.pix_fmt = NI_LOGAN_PIX_FMT_YUV420P;
     
+    /* Initialize color space parameters (required by library) */
+    ctx->enc.color_primaries = 2;  /* NI_COL_PRI_UNSPECIFIED */
+    ctx->enc.color_trc = 2;        /* NI_COL_TRC_UNSPECIFIED */
+    ctx->enc.color_space = 2;      /* NI_COL_SPC_UNSPECIFIED */
+    ctx->enc.color_range = 0;      /* NI_COL_RANGE_UNSPECIFIED */
+    
+    /* Initialize sample aspect ratio (1:1 = square pixels) */
+    ctx->enc.sar_num = 1;
+    ctx->enc.sar_den = 1;
+    
     /* Store rate control mode and profile strings (used later for parameter setting) */
     ctx->rc_mode = bstrdup(obs_data_get_string(settings, "rc_mode"));
     ctx->profile = bstrdup(obs_data_get_string(settings, "profile"));
@@ -554,6 +578,12 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     if (ctx->enc.p_encoder_params && p_ni_logan_encoder_params_set_value) {
         ni_logan_encoder_params_t *params = (ni_logan_encoder_params_t *)ctx->enc.p_encoder_params;
         ni_logan_session_context_t *session_ctx = (ni_logan_session_context_t *)ctx->enc.p_session_ctx;
+        
+        /* NOTE: Do NOT enable GenHdrs! */
+        /* Some T4xx hardware/firmware doesn't support pre-generating headers */
+        /* and it causes params_parse to fail with ERROR_INVALID_SESSION (-5) */
+        /* Instead, we always extract headers from the first encoded packet */
+        blog(LOG_INFO, "[obs-netint-t4xx] Will extract headers from first encoded packet (GenHdrs disabled)");
         
         /* Set rate control mode: CBR (constant) or VBR (variable) */
         /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
@@ -595,17 +625,45 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     
     /* Parse and validate all encoder parameters */
     /* This checks for parameter conflicts and applies defaults */
-    if (p_ni_logan_encode_params_parse(&ctx->enc) < 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to parse encoder parameters");
+    /* If generate_enc_hdrs is set, this will also generate headers automatically */
+    blog(LOG_INFO, "[obs-netint-t4xx] Calling ni_logan_encode_params_parse (will generate headers)...");
+    int parse_ret = p_ni_logan_encode_params_parse(&ctx->enc);
+    blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_params_parse returned: %d", parse_ret);
+    
+    if (parse_ret < 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to parse encoder parameters (ret=%d)", parse_ret);
         goto fail;
     }
     
-    /* Open connection to hardware encoder device */
+    /* Check if headers were generated during params_parse */
+    blog(LOG_INFO, "[obs-netint-t4xx] After params_parse: extradata=%p, extradata_size=%d", 
+         ctx->enc.extradata, ctx->enc.extradata_size);
+    
+    if (ctx->enc.extradata && ctx->enc.extradata_size > 0) {
+        /* Headers were successfully generated - use them */
+        ctx->extra = bmemdup(ctx->enc.extradata, (size_t)ctx->enc.extradata_size);
+        ctx->extra_size = (size_t)ctx->enc.extradata_size;
+        blog(LOG_INFO, "[obs-netint-t4xx] Headers generated during init, size: %zu bytes", ctx->extra_size);
+        ctx->got_headers = true;
+    } else {
+        /* Headers not generated - this is normal for some T4xx hardware/firmware versions */
+        /* We'll extract them from the first encoded packet instead */
+        blog(LOG_INFO, "[obs-netint-t4xx] Headers not available during init. Will extract from first encoded packet.");
+        ctx->got_headers = false;
+    }
+    
+    /* Open connection to hardware encoder device for actual encoding */
     /* This establishes communication with the PCIe card and allocates hardware resources */
-    blog(LOG_INFO, "[obs-netint-t4xx] Calling ni_logan_encode_open with dev_xcoder='%s' dev_enc_name='%s' dev_enc_idx=%d",
+    /* Note: This is different from the temporary open done during header generation */
+    blog(LOG_INFO, "[obs-netint-t4xx] Calling ni_logan_encode_open for encoding session...");
+    blog(LOG_INFO, "[obs-netint-t4xx] enc context: dev_xcoder='%s' dev_enc_name='%s' dev_enc_idx=%d",
          ctx->enc.dev_xcoder ? ctx->enc.dev_xcoder : "(null)",
          ctx->enc.dev_enc_name ? ctx->enc.dev_enc_name : "(null)",
          ctx->enc.dev_enc_idx);
+    blog(LOG_INFO, "[obs-netint-t4xx] enc context: p_session_ctx=%p, p_encoder_params=%p",
+         ctx->enc.p_session_ctx, ctx->enc.p_encoder_params);
+    blog(LOG_INFO, "[obs-netint-t4xx] enc context: width=%d, height=%d, codec_format=%d",
+         ctx->enc.width, ctx->enc.height, ctx->enc.codec_format);
     
     int open_ret = p_ni_logan_encode_open(&ctx->enc);
     blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_open returned: %d", open_ret);
@@ -621,32 +679,23 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
          ctx->enc.actual_dev_name ? ctx->enc.actual_dev_name : "(unknown)",
          ctx->enc.actual_dev_enc_idx);
     
-    /* Generate encoder headers (SPS/PPS for H.264, VPS/SPS/PPS for H.265) */
-    /* These headers contain stream configuration and are needed for decoder initialization */
-    /* We store them in ctx->extra for OBS to include in stream initialization */
-    blog(LOG_INFO, "[obs-netint-t4xx] Calling ni_logan_encode_header to generate SPS/PPS...");
-    int header_ret = p_ni_logan_encode_header(&ctx->enc);
-    blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_header returned: %d", header_ret);
-    
-    if (header_ret == 0 && ctx->enc.extradata && ctx->enc.extradata_size > 0) {
-        ctx->extra = bmemdup(ctx->enc.extradata, (size_t)ctx->enc.extradata_size);
-        ctx->extra_size = (size_t)ctx->enc.extradata_size;
-        blog(LOG_INFO, "[obs-netint-t4xx] Encoder initialized successfully: %dx%d @ %d kbps", 
-             ctx->enc.width, ctx->enc.height, (int)(ctx->enc.bit_rate / 1000));
-        blog(LOG_INFO, "[obs-netint-t4xx] Extradata size: %zu bytes", ctx->extra_size);
-    } else {
-        blog(LOG_WARNING, "[obs-netint-t4xx] Failed to generate encoder headers (ret=%d), but encoder is open. Will try to proceed anyway.", header_ret);
-        /* Don't fail - some encoders work without pre-generated headers */
+    /* Note: Headers might not be available yet if hardware doesn't support pre-generation */
+    /* In that case, we'll extract them from the first encoded packet */
+    if (!ctx->got_headers) {
+        blog(LOG_INFO, "[obs-netint-t4xx] Headers will be extracted from first encoded packet");
     }
 
     /* Start background receive thread for asynchronous packet reception */
     /* This thread continuously polls for encoded packets and queues them */
     /* This reduces latency by having packets ready when OBS requests them */
+    blog(LOG_INFO, "[obs-netint-t4xx] Creating background receive thread...");
     ctx->stop_thread = false;
     if (pthread_create(&ctx->recv_thread, NULL, netint_recv_thread, ctx) != 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to create receive thread");
         goto fail;
     }
+    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread created successfully");
+    blog(LOG_INFO, "[obs-netint-t4xx] Encoder creation complete, returning context to OBS");
     return ctx;
 fail:
     /* Cleanup all allocated resources on any failure */
@@ -718,31 +767,48 @@ static void netint_destroy(void *data)
     da_free(ctx->pkt_queue);
     
     /* Close hardware encoder connection */
-    /* Only close if encoder was actually opened (p_session_ctx or started flag set) */
-    if (ctx->enc.p_session_ctx || ctx->enc.started) {
+    /* Only close if encoder was actually opened (p_session_ctx AND started flag set) */
+    /* Check started flag to avoid closing partially-initialized encoder */
+    if (ctx->enc.p_session_ctx && ctx->enc.started) {
+        blog(LOG_INFO, "[obs-netint-t4xx] Closing encoder session (started=%d)...", ctx->enc.started);
         if (p_ni_logan_encode_close) {
-            p_ni_logan_encode_close(&ctx->enc);
+            int close_ret = p_ni_logan_encode_close(&ctx->enc);
+            blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_close returned: %d", close_ret);
         }
+    } else {
+        blog(LOG_INFO, "[obs-netint-t4xx] Skipping encode_close (started=%d, p_session_ctx=%p)", 
+             ctx->enc.started, ctx->enc.p_session_ctx);
+        /* NOTE: Do NOT manually free p_session_ctx or p_encoder_params! */
+        /* These were allocated by libxcoder_logan.dll and must be freed by it */
+        /* Cross-DLL memory management causes heap corruption on Windows */
+        /* The library will clean up when the process exits, or we can call ni_logan_encode_close */
+        /* if we want explicit cleanup, but that requires the encoder to be in a valid state */
     }
     
-    /* Free device name strings (if allocated) */
+    /* Free device name strings (allocated by us with bstrdup) */
+    /* These are safe to free - we allocated them before calling library functions */
     if (ctx->enc.dev_enc_name) {
         bfree(ctx->enc.dev_enc_name);
+        ctx->enc.dev_enc_name = NULL;
     }
     if (ctx->enc.dev_xcoder) {
         bfree(ctx->enc.dev_xcoder);
+        ctx->enc.dev_xcoder = NULL;
     }
     
-    /* Free extradata (SPS/PPS headers) */
+    /* Free extradata (SPS/PPS headers) - allocated by us */
     if (ctx->extra) {
         bfree(ctx->extra);
         ctx->extra = NULL;
         ctx->extra_size = 0;
     }
     
-    /* Free configuration strings */
+    /* Free configuration strings - allocated by us */
     if (ctx->rc_mode) bfree(ctx->rc_mode);
     if (ctx->profile) bfree(ctx->profile);
+    
+    /* enc is EMBEDDED in ctx, so it will be freed when ctx is freed */
+    /* No need to manually free it */
     
     /* Free context structure itself */
     bfree(ctx);
@@ -967,13 +1033,19 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
  */
 static void *netint_recv_thread(void *param)
 {
+    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread: ENTRY POINT");
     struct netint_ctx *ctx = param;
+    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread: ctx pointer = %p", ctx);
+    
+    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread started, entering main loop");
     
     /* Main receive loop - runs until encoder is destroyed or EOF */
     while (!ctx->stop_thread) {
         /* Poll encoder for encoded packet - non-blocking call */
         /* Returns: >0 = packet size, 0 = no packet ready, <0 = error or EOF */
+        blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: calling ni_logan_encode_receive...");
         int got = p_ni_logan_encode_receive(&ctx->enc);
+        blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: ni_logan_encode_receive returned %d", got);
         
         if (got > 0) {
             /* Packet is available - allocate buffer for it */
@@ -993,6 +1065,32 @@ static void *netint_recv_thread(void *param)
             if (p_ni_logan_encode_copy_packet_data(&ctx->enc, buf, first, 0) == 0) {
                 /* Mark that first packet has arrived (for future packets) */
                 ctx->enc.firstPktArrived = 1;
+                
+                /* Extract headers from first packet if not already obtained during init */
+                /* The first packet from the encoder always contains SPS/PPS/VPS headers */
+                /* These are needed for stream initialization (decoders need them to start) */
+                if (first && !ctx->got_headers) {
+                    blog(LOG_INFO, "[obs-netint-t4xx] First packet received, extracting headers (size=%d)...", got);
+                    
+                    /* Free any existing extradata (shouldn't happen, but be safe) */
+                    if (ctx->extra) {
+                        bfree(ctx->extra);
+                        ctx->extra = NULL;
+                        ctx->extra_size = 0;
+                    }
+                    
+                    /* Copy entire first packet as headers */
+                    /* For H.264/H.265, the first packet contains SPS/PPS/VPS NAL units */
+                    ctx->extra = bmemdup(buf, (size_t)got);
+                    ctx->extra_size = (size_t)got;
+                    ctx->got_headers = true;
+                    
+                    blog(LOG_INFO, "[obs-netint-t4xx] Headers extracted from first packet: %zu bytes", ctx->extra_size);
+                    
+                    /* NOTE: Do NOT free/reallocate ctx->enc.extradata - it's managed by libxcoder! */
+                    /* Cross-DLL memory management causes heap corruption on Windows */
+                    /* The encoder library will manage its own extradata pointer */
+                }
                 
                 /* Create packet structure with metadata */
                 struct netint_pkt pkt = {0};
@@ -1044,6 +1142,7 @@ static void *netint_recv_thread(void *param)
             continue;
         } else if (got < 0) {
             /* Error or EOF from encoder */
+            blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: got < 0, encoder_eof=%d", ctx->enc.encoder_eof);
             if (ctx->enc.encoder_eof) {
                 /* Encoder signaled EOF (end of stream) - stop receiving */
                 /* This happens when encoder is flushed and all packets are drained */
@@ -1067,10 +1166,11 @@ static void *netint_recv_thread(void *param)
         
         /* No packet ready - sleep briefly to avoid busy-waiting */
         /* 2ms sleep balances responsiveness with CPU usage */
+        blog(LOG_DEBUG, "[obs-netint-t4xx] Receive thread: no packet ready, sleeping 2ms");
         os_sleep_ms(2);
     }
     
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread exiting");
+    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread exiting normally");
     return NULL;
 }
 
@@ -1175,7 +1275,9 @@ static obs_properties_t *netint_get_properties(void *data)
     /* This converts the text input to a dropdown with discovered devices */
     if (p_ni_logan_rsrc_init && p_ni_logan_rsrc_get_local_device_list) {
         /* Initialize resource management system */
-        if (p_ni_logan_rsrc_init(0, 1) == 0) {
+        /* Accept both SUCCESS (0) and INIT_ALREADY (0x7FFFFFFF) as success */
+        int rsrc_ret = p_ni_logan_rsrc_init(0, 1);
+        if (rsrc_ret == 0 || rsrc_ret == 0x7FFFFFFF) {
             char names[16][NI_LOGAN_MAX_DEVICE_NAME_LEN] = {0};
             int n = p_ni_logan_rsrc_get_local_device_list(names, 16);
             if (n > 0) {
@@ -1227,14 +1329,39 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
 {
     struct netint_ctx *ctx = data;
     
-    /* Check if extradata was successfully generated during initialization */
-    if (!ctx->extra || !ctx->extra_size)
+    /* If headers not available yet, wait for them (up to 5 seconds) */
+    /* This handles the case where headers are extracted from the first packet */
+    if (!ctx->got_headers) {
+        blog(LOG_INFO, "[obs-netint-t4xx] Headers not yet available, waiting for first packet...");
+        
+        /* Wait up to 5 seconds (50 x 100ms) for headers to be extracted */
+        for (int i = 0; i < 50; i++) {
+            os_sleep_ms(100);
+            
+            if (ctx->got_headers) {
+                blog(LOG_INFO, "[obs-netint-t4xx] Headers became available after %d ms", i * 100);
+                break;
+            }
+        }
+        
+        if (!ctx->got_headers) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Timeout waiting for encoder headers");
+            return false;
+        }
+    }
+    
+    /* Double-check extradata is valid */
+    if (!ctx->extra || !ctx->extra_size) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Headers flag set but extradata is NULL");
         return false;
+    }
     
     /* Return extradata pointer and size to OBS */
     /* OBS will copy this data if needed, so we don't need to allocate */
     *extra_data = ctx->extra;
     *size = ctx->extra_size;
+    
+    blog(LOG_DEBUG, "[obs-netint-t4xx] Returning %zu bytes of header data", *size);
     return true;
 }
 

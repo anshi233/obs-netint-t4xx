@@ -124,8 +124,13 @@ bool obs_module_load(void)
             int rsrc_ret = p_ni_logan_rsrc_init(0, 1); /* should_match_rev=0, timeout=1s */
             blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_rsrc_init returned: %d (0x%X)", rsrc_ret, rsrc_ret);
             
-            if (rsrc_ret == 0) {
-                blog(LOG_INFO, "[obs-netint-t4xx] Resource manager initialized successfully!");
+            /* Accept both SUCCESS (0) and INIT_ALREADY (INT32_MAX / 0x7FFFFFFF) as success */
+            if (rsrc_ret == 0 || rsrc_ret == 0x7FFFFFFF) {
+                if (rsrc_ret == 0x7FFFFFFF) {
+                    blog(LOG_INFO, "[obs-netint-t4xx] Resource manager already initialized (by external process).");
+                } else {
+                    blog(LOG_INFO, "[obs-netint-t4xx] Resource manager initialized successfully!");
+                }
             } else {
                 blog(LOG_WARNING, "[obs-netint-t4xx] Resource manager initialization failed (ret=%d). Device auto-selection may not work.", rsrc_ret);
                 blog(LOG_WARNING, "[obs-netint-t4xx] Check: 1) Is init_rsrc_logan.exe running with admin? 2) Try running it from: %s", 
