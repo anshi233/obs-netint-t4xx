@@ -143,12 +143,17 @@ struct netint_ctx {
     bool thread_created;              /**< true if recv_thread was successfully created */
     struct netint_pkt *pkt_queue_head; /**< Head of packet queue (oldest packet) */
     struct netint_pkt *pkt_queue_tail; /**< Tail of packet queue (newest packet) */
+
+    /* Debug flags */
+    bool debug_eos_sent;              /**< true if debug EOS was already sent */
     
     char *rc_mode;                     /**< Rate control mode: "CBR" or "VBR" */
     char *profile;                      /**< Encoder profile: "baseline", "main", or "high" */
     bool repeat_headers;               /**< If true, attach SPS/PPS to every keyframe */
     int codec_type;                    /**< Codec type: 0 = H.264, 1 = H.265 (HEVC) */
-    
+    uint64_t frame_count;              /**< Total frames processed (for start_of_stream logic) */
+    int keyint_frames;                 /**< Keyframe interval in frames */
+
     /* Error tracking and health monitoring */
     int consecutive_errors;            /**< Count of consecutive errors (reset on success) */
     int total_errors;                  /**< Total error count since encoder creation */
@@ -265,6 +270,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->consecutive_errors = 0;
     ctx->total_errors = 0;
     ctx->encoder_start_time = os_gettime_ns();
+    ctx->frame_count = 0;
     
 #ifdef DEBUG_NETINT_PLUGIN
     /* Initialize debug magic for validation - ALWAYS set this! */
@@ -339,9 +345,9 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     if (keyint_seconds <= 0) keyint_seconds = 2; /* Default 2 seconds */
     
     /* Convert seconds to frames based on framerate */
-    int keyint_frames = (int)(keyint_seconds * (voi->fps_num / (double)voi->fps_den));
+    ctx->keyint_frames = (int)(keyint_seconds * (voi->fps_num / (double)voi->fps_den));
     blog(LOG_INFO, "[obs-netint-t4xx] Keyframe interval: %d seconds = %d frames @ %.2f fps",
-         keyint_seconds, keyint_frames, voi->fps_num / (double)voi->fps_den);
+         keyint_seconds, ctx->keyint_frames, voi->fps_num / (double)voi->fps_den);
     
     /* Set timebase for timestamps (matches OBS video output timebase) */
     /* timebase = fps_den / fps_num (e.g., 1/30 for 30fps, 1001/30000 for 29.97fps) */
@@ -459,8 +465,32 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
 #endif
     
     blog(LOG_INFO, "[obs-netint-t4xx] ni_logan_encode_init succeeded and allocated internal structures");
-    
-    /* Set advanced encoder parameters after initial init */
+
+    /* ===================================================================
+     * Set VUI (Video Usability Information) parameters
+     * ===================================================================
+     * Critical: VUI parameters must be set after encode_init but before params_parse,
+     * just like xcoder_logan does. This configures color space, primaries,
+     * transfer characteristics, and SAR.
+     */
+
+    blog(LOG_INFO, "[obs-netint-t4xx] Setting VUI parameters after encode_init...");
+    ni_logan_encoder_params_t *vui_params = (ni_logan_encoder_params_t *)ctx->enc.p_encoder_params;
+    ni_logan_session_context_t *vui_ctx = (ni_logan_session_context_t *)ctx->enc.p_session_ctx;
+    if (vui_params && vui_ctx) {
+        p_ni_logan_set_vui(vui_params, vui_ctx,
+                           (ni_color_primaries_t)ctx->enc.color_primaries,
+                           (ni_color_transfer_characteristic_t)ctx->enc.color_trc,
+                           (ni_color_space_t)ctx->enc.color_space,
+                           0, /* video_full_range_flag */
+                           ctx->enc.sar_num, ctx->enc.sar_den,
+                           (ni_logan_codec_format_t)ctx->enc.codec_format);
+        blog(LOG_INFO, "[obs-netint-t4xx] VUI parameters set successfully");
+    } else {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Cannot set VUI parameters - p_encoder_params or p_session_ctx is NULL!");
+    }
+
+    /* Set advanced encoder parameters after initial init and VUI setup */
     /* These parameters require the encoder to be initialized first (they modify internal state) */
     if (ctx->enc.p_encoder_params && p_ni_logan_encoder_params_set_value) {
         ni_logan_encoder_params_t *params = (ni_logan_encoder_params_t *)ctx->enc.p_encoder_params;
@@ -471,21 +501,24 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         /* and it causes params_parse to fail with ERROR_INVALID_SESSION (-5) */
         /* Instead, we always extract headers from the first encoded packet */
         blog(LOG_INFO, "[obs-netint-t4xx] Will extract headers from first encoded packet (GenHdrs disabled)");
-        
-        /* Set keyframe interval (GOP size) */
-        /* Try common parameter names: gopPresetIdx, intraPeriod, gopSize, gopNum */
-        char keyint_str[32];
-        snprintf(keyint_str, sizeof(keyint_str), "%d", keyint_frames);
-        
-        /* Try setting with various possible parameter names */
-        /* The library will ignore unknown parameters, so it's safe to try multiple */
-        blog(LOG_INFO, "[obs-netint-t4xx] Setting GOP size to %d frames (trying multiple param names)", keyint_frames);
-        int gop_ret1 = p_ni_logan_encoder_params_set_value(params, "gopPresetIdx", keyint_str, session_ctx);
-        int gop_ret2 = p_ni_logan_encoder_params_set_value(params, "intraPeriod", keyint_str, session_ctx);
-        int gop_ret3 = p_ni_logan_encoder_params_set_value(params, "gopSize", keyint_str, session_ctx);
-        blog(LOG_INFO, "[obs-netint-t4xx] GOP param set results: gopPresetIdx=%d, intraPeriod=%d, gopSize=%d",
-             gop_ret1, gop_ret2, gop_ret3);
-        
+
+        /* ===================================================================
+         * GOP Parameter Setting - DISABLED
+         * ===================================================================
+         * All GOP parameter setting APIs return "Unknown option" (-7).
+         * This suggests GOP parameters cannot be set through parameter APIs
+         * in this version of libxcoder_logan. The encoder will use defaults.
+         *
+         * If GOP parameters are needed, they may need to be set through:
+         * - Direct structure field modification
+         * - Low-level session context configuration
+         * - Firmware-specific configuration
+         *
+         * For now, rely on encoder defaults and focus on getting video output.
+         */
+
+        blog(LOG_INFO, "[obs-netint-t4xx] GOP parameters disabled - using encoder defaults");
+
         /* Set rate control mode: CBR (constant) or VBR (variable) */
         /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
         if (ctx->rc_mode) {
@@ -595,7 +628,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     
     blog(LOG_INFO, "[obs-netint-t4xx] ✅ Encoder session opened and configured!");
     blog(LOG_INFO, "[obs-netint-t4xx] Hardware is now ready to accept frames");
-    
+
     blog(LOG_INFO, "[obs-netint-t4xx] Encoder initialization complete!");
     blog(LOG_INFO, "[obs-netint-t4xx] Headers will be extracted from first encoded packet");
 
@@ -818,9 +851,11 @@ static void *netint_recv_thread(void *data)
     while (!ctx->stop_thread) {
         /* ✅ Read packet directly from hardware using device session API */
         /* This can BLOCK - that's OK in background thread! */
+        blog(LOG_DEBUG, "[obs-netint-t4xx] [RECV THREAD] Attempting to read packet...");
         int recv_size = p_ni_logan_device_session_read(ctx->enc.p_session_ctx, &out_packet,
                                                         NI_LOGAN_DEVICE_TYPE_ENCODER);
-        
+        blog(LOG_DEBUG, "[obs-netint-t4xx] [RECV THREAD] device_session_read returned: %d", recv_size);
+
         if (ctx->stop_thread) break;  /* Check after blocking call */
         
         /* Check if we got a valid packet (accounting for metadata size) */
@@ -939,6 +974,15 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     struct netint_ctx *ctx = data;
     *received = false;
 
+    /* DEBUG: Log every call to netint_encode to see if OBS is calling us */
+    static int call_count = 0;
+    call_count++;
+    blog(LOG_INFO, "[obs-netint-t4xx] ▶ netint_encode() call #%d: frame=%p", call_count, frame);
+
+    /* DEBUG: Check encoder state */
+    blog(LOG_INFO, "[obs-netint-t4xx] Encoder state: started=%d, p_input_fme=%p",
+         ctx->enc.started, ctx->enc.p_input_fme);
+
 #ifdef DEBUG_NETINT_PLUGIN
     /* Validate magic number to detect corruption */
     if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
@@ -953,13 +997,80 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     NETINT_VALIDATE_ENC_CONTEXT(ctx, "netint_encode entry");
 
     /* ===================================================================
-     * STEP 1: Check packet queue for available packets
+     * STEP 1: ALWAYS check for available packets FIRST
      * ===================================================================
-     * 
-     * Background thread continuously calls encode_receive() and adds packets
-     * to the queue. We check if any packets are available (non-blocking).
+     *
+     * Critical: Check for packets BEFORE sending frames. The encoder may have
+     * buffered frames and produced packets that need to be returned immediately.
+     * This matches the xcoder_logan pattern: receive -> send -> receive -> send...
      */
-    
+
+    /* DEBUG: Try synchronous receive like xcoder_logan */
+    if (!*received) {
+        /* Try to receive a packet synchronously, just like xcoder_logan does */
+        ni_logan_session_data_io_t sync_packet = {0};
+        ni_logan_packet_t *sync_pkt = &sync_packet.data.packet;
+
+        /* Allocate packet buffer for synchronous read */
+        int alloc_ret = p_ni_logan_packet_buffer_alloc(sync_pkt, NI_LOGAN_MAX_TX_SZ);
+        if (alloc_ret == NI_LOGAN_RETCODE_SUCCESS) {
+            /* Try synchronous read */
+            int sync_recv_size = p_ni_logan_device_session_read(ctx->enc.p_session_ctx, &sync_packet,
+                                                               NI_LOGAN_DEVICE_TYPE_ENCODER);
+
+            if (sync_recv_size > 16) {  /* Got a real packet (> metadata size) */
+                int packet_size = sync_recv_size - 16;  /* Subtract metadata */
+
+                blog(LOG_INFO, "[obs-netint-t4xx] ✅ SYNC RECEIVE: Got packet %d bytes (total %d)",
+                     packet_size, sync_recv_size);
+
+                /* Check if this is the header packet (first packet) */
+                if (!ctx->got_headers && packet_size == 65) {
+                    blog(LOG_INFO, "[obs-netint-t4xx] SYNC RECEIVE: Extracting headers from first packet");
+                    if (ctx->extra) bfree(ctx->extra);
+                    ctx->extra = bmemdup(sync_pkt->p_data, (size_t)packet_size);
+                    ctx->extra_size = (size_t)packet_size;
+                    ctx->got_headers = true;
+                } else {
+                    /* This is a video packet! */
+                    blog(LOG_INFO, "[obs-netint-t4xx] ✅ SYNC RECEIVE: VIDEO PACKET! %d bytes", packet_size);
+
+                    packet->data = bmalloc((size_t)packet_size);
+                    if (packet->data) {
+                        memcpy(packet->data, sync_pkt->p_data, (size_t)packet_size);
+                        packet->size = (size_t)packet_size;
+                        packet->pts = sync_pkt->pts;
+                        packet->dts = sync_pkt->dts;
+                        packet->type = OBS_ENCODER_VIDEO;
+
+                        /* Get timebase */
+                        video_t *video = obs_encoder_video(ctx->encoder);
+                        const struct video_output_info *voi = video_output_get_info(video);
+                        packet->timebase_num = (int32_t)voi->fps_den;
+                        packet->timebase_den = (int32_t)voi->fps_num;
+
+                        /* Parse packet for keyframe and priority */
+                        if (ctx->codec_type == 1) {
+                            packet->keyframe = obs_hevc_keyframe(packet->data, packet->size);
+                            packet->priority = obs_parse_hevc_packet_priority(packet);
+                        } else {
+                            packet->keyframe = obs_avc_keyframe(packet->data, packet->size);
+                            packet->priority = obs_parse_avc_packet_priority(packet);
+                        }
+
+                        *received = true;
+                        blog(LOG_INFO, "[obs-netint-t4xx] ✅ SYNC RECEIVE: Returning VIDEO packet to OBS: %zu bytes, keyframe=%d",
+                             packet->size, packet->keyframe);
+                        p_ni_logan_packet_buffer_free(sync_pkt);
+                        return true;
+                    }
+                }
+            }
+            p_ni_logan_packet_buffer_free(sync_pkt);
+        }
+    }
+
+    /* Fallback: Try to get any queued packets from background thread */
     pthread_mutex_lock(&ctx->queue_mutex);
     struct netint_pkt *pkt = ctx->pkt_queue_head;
     if (pkt) {
@@ -970,145 +1081,273 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
         }
     }
     pthread_mutex_unlock(&ctx->queue_mutex);
-    
+
     /* If we have a packet, return it to OBS */
     if (pkt) {
-        blog(LOG_INFO, "[obs-netint-t4xx] Returning queued packet: size=%zu, pts=%lld, keyframe=%d",
+        blog(LOG_INFO, "[obs-netint-t4xx] ✅ Returning queued packet: size=%zu, pts=%lld, keyframe=%d",
              pkt->size, (long long)pkt->pts, pkt->keyframe);
-        
+
         packet->data = pkt->data;
         packet->size = pkt->size;
         packet->pts = pkt->pts;
         packet->dts = pkt->dts;
         packet->keyframe = pkt->keyframe;
         packet->type = OBS_ENCODER_VIDEO;
-        
+
         /* Get timebase */
         video_t *video = obs_encoder_video(ctx->encoder);
         const struct video_output_info *voi = video_output_get_info(video);
         packet->timebase_num = (int32_t)voi->fps_den;
         packet->timebase_den = (int32_t)voi->fps_num;
-        
+
         /* Parse packet for priority */
         if (ctx->codec_type == 1) {
             packet->priority = obs_parse_hevc_packet_priority(packet);
         } else {
             packet->priority = obs_parse_avc_packet_priority(packet);
         }
-        
+
         /* Free packet struct (but NOT data - OBS owns it now!) */
         bfree(pkt);
-        
+
         *received = true;
+        blog(LOG_INFO, "[obs-netint-t4xx] ✅ Packet returned to OBS: %zu bytes", packet->size);
         return true;
     }
-    
+
     /* ===================================================================
-     * STEP 2: Send frame to encoder (if we have one)
+     * STEP 2: Send frame to encoder (if we have one and FIFO not full)
      * ===================================================================
-     * 
-     * ✅ NEW DEVICE SESSION API APPROACH:
-     * - Allocate frame buffer directly (no FIFO!)
-     * - Copy YUV data using copy_hw_yuv420p
-     * - Write directly to hardware using device_session_write
-     * - Free frame buffer immediately after send
-     * 
-     * This bypasses the FIFO-based encode_get_frame/send and eliminates
-     * race conditions where encode_receive() steals frames mid-preparation!
+     *
+     * ✅ PROPER HIGH-LEVEL API SEQUENCE:
+     * - encode_get_frame() - gets buffer from FIFO, sets p_input_fme
+     * - encode_copy_frame_data() - copies data to allocated buffer
+     * - encode_send() - sends frame using high-level session management
+     *
+     * This ensures proper buffer management and session state handling!
      */
     if (frame) {
-        /* Allocate our own frame buffer (not from FIFO!) */
-        ni_logan_session_data_io_t in_frame = {0};
-        ni_logan_frame_t *ni_frame = &in_frame.data.frame;
-        
-        /* Get HW dimensions and strides for YUV420P format */
-        int dst_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
-        int dst_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> Processing frame: %dx%d @ %lld",
+             ctx->enc.width, ctx->enc.height, (long long)frame->pts);
+
+        /* Get basic frame dimensions */
         int width = ctx->enc.width;
         int height = ctx->enc.height;
-        int is_h264 = (ctx->codec_type == 0) ? 1 : 0;  /* 0=H264, 1=H265 */
-        
-        p_ni_logan_get_hw_yuv420p_dim(width, height, 1, is_h264, dst_stride, dst_height);
-        
-        blog(LOG_INFO, "[obs-netint-t4xx] >>> Allocating frame buffer: %dx%d, is_h264=%d",
-             width, height, is_h264);
-        
-        /* Allocate frame buffer directly (no FIFO involvement!) */
-        /* Parameters: frame, width, height, linesize[], is_h264, extra_len */
-        int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
-                                                                dst_stride, is_h264, 0);
-        if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame buffer (ret=%d)", alloc_ret);
+
+        /* STEP 1: Get frame buffer from encoder FIFO */
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> Getting frame buffer from encoder FIFO...");
+        int get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
+        if (get_ret != NI_LOGAN_RETCODE_SUCCESS) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] encode_get_frame failed (ret=%d)", get_ret);
             return false;
         }
-        
-        /* Initialize frame metadata */
+
+        /* Get the frame buffer that was allocated by encode_get_frame */
+        ni_logan_session_data_io_t *input_fme = (ni_logan_session_data_io_t *)ctx->enc.p_input_fme;
+        if (!input_fme) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Frame buffer is NULL after encode_get_frame!");
+            return false;
+        }
+        ni_logan_frame_t *ni_frame = &input_fme->data.frame;
+
+        /* CRITICAL: Allocate the actual data buffers for the frame */
+        /* encode_get_frame only sets up the structure, not the data buffers */
+        int dst_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
+        int dst_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
+        p_ni_logan_get_hw_yuv420p_dim(width, height, 1, (ctx->codec_type == 0) ? 1 : 0, dst_stride, dst_height);
+
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> Allocating frame data buffers: %dx%d, strides=%d/%d/%d",
+             width, height, dst_stride[0], dst_stride[1], dst_stride[2]);
+
+        int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
+                                                               dst_stride, (ctx->codec_type == 0) ? 1 : 0, 0);
+        if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame data buffers (ret=%d)", alloc_ret);
+            return false;
+        }
+
+        /* Set up frame buffer dimensions BEFORE copy */
+        /* encode_get_frame allocates the buffer but doesn't set metadata */
         ni_frame->video_width = width;
         ni_frame->video_height = height;
-        ni_frame->video_orig_width = width;
-        ni_frame->video_orig_height = height;
         ni_frame->pts = frame->pts;
         ni_frame->dts = 0;
-        ni_frame->start_of_stream = (ctx->enc.started == 0) ? 1 : 0;
+        ni_frame->start_of_stream = (ctx->frame_count == 0) ? 1 : 0;
         ni_frame->end_of_stream = 0;
-        ni_frame->force_key_frame = 0;
-        
+
+        /* Set keyframe properties based on keyframe interval */
+        /* Force keyframes at the beginning and every N frames */
+        /* DEBUG: Force keyframes for first few frames to help encoder start producing data */
+        int is_keyframe = (ctx->frame_count == 0) || (ctx->frame_count % ctx->keyint_frames == 0) || (ctx->frame_count <= 5);
+        ni_frame->force_key_frame = is_keyframe ? 1 : 0;
+        ni_frame->ni_logan_pict_type = is_keyframe ? LOGAN_PIC_TYPE_IDR : NI_LOGAN_PIC_TYPE_P;
+
         blog(LOG_INFO, "[obs-netint-t4xx] >>> Frame metadata: pts=%lld, start_of_stream=%d",
              (long long)ni_frame->pts, ni_frame->start_of_stream);
-        
-        /* Prepare source plane pointers and strides from OBS frame */
+
+        /* STEP 2: Copy YUV data directly to the allocated frame buffer */
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> Copying YUV data directly to frame buffer...");
+
+        /* Check that the frame buffer has valid data pointers */
+        if (!ni_frame->p_data[0]) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Frame buffer p_data[0] is NULL!");
+            return false;
+        }
+
         uint8_t *src_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
             frame->data[0], frame->data[1], frame->data[2], NULL
         };
         int src_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
             frame->linesize[0], frame->linesize[1], frame->linesize[2], 0
         };
-        
-        /* Copy YUV data from OBS frame to hardware frame buffer */
-        /* This converts OBS's YUV420P layout to hardware's expected format */
-        blog(LOG_INFO, "[obs-netint-t4xx] >>> Copying YUV data...");
-        p_ni_logan_copy_hw_yuv420p((uint8_t **)ni_frame->p_data, (uint8_t **)src_planes, 
-                                    width, height, 1,  /* factor=1 for full res */
+
+        /* Copy YUV data using hardware-optimized function */
+        /* Use the strides that were used for buffer allocation */
+        p_ni_logan_copy_hw_yuv420p((uint8_t **)ni_frame->p_data, (uint8_t **)src_planes,
+                                    width, height, 1,
                                     dst_stride, dst_height, src_stride, src_stride);
         blog(LOG_INFO, "[obs-netint-t4xx] >>> YUV copy complete");
-        
-        /* Write frame directly to hardware using device session API */
-        /* This bypasses the FIFO entirely - no race conditions! */
-        blog(LOG_INFO, "[obs-netint-t4xx] >>> Writing frame to hardware...");
-        int sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, &in_frame,
+
+        /* STEP 3: Send frame using device session write (with properly allocated buffer) */
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> Sending frame via device_session_write...");
+        int sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, ctx->enc.p_input_fme,
                                                     NI_LOGAN_DEVICE_TYPE_ENCODER);
-        
-        blog(LOG_INFO, "[obs-netint-t4xx] >>> device_session_write returned: %d", sent);
-        
-        /* Free the frame buffer immediately (hardware has copied it) */
-        p_ni_logan_frame_buffer_free(ni_frame);
-        
-        if (sent <= 0) {
+
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> device_session_write returned: %d (expect >0 for success, 0=try again, <0=error)", sent);
+
+        /* Note: Frame buffer is managed by libxcoder when using encode_get_frame */
+
+        if (sent < 0) {
+            /* Fatal error - encoder is broken */
             blog(LOG_ERROR, "[obs-netint-t4xx] device_session_write failed (ret=%d)", sent);
             return false;
+        } else if (sent == 0) {
+            /* FIFO full - not ready for more frames */
+            /* Don't treat as error, just skip this frame */
+            /* OBS will call us again later when encoder is ready */
+            blog(LOG_WARNING, "[obs-netint-t4xx] Encoder FIFO full, skipping frame (will retry)");
+            *received = false;
+            return true;
         }
-        
-        /* Mark encoder as started after first frame */
-        if (!ctx->enc.started) {
+
+        /* Mark encoder as started after first successful frame send */
+        if (sent > 0 && !ctx->enc.started) {
             ctx->enc.started = 1;
             blog(LOG_INFO, "[obs-netint-t4xx] ✅ Encoder started! First frame sent to hardware.");
         }
-        
+
         blog(LOG_INFO, "[obs-netint-t4xx] ✅ Frame sent successfully (PTS=%lld, sent=%d bytes)",
              (long long)frame->pts, sent);
+
+        /* Increment frame count for start_of_stream logic */
+        ctx->frame_count++;
+
+        /* DEBUG: Force EOS after 10 frames to see if encoder produces packets when flushed */
+        if (ctx->frame_count >= 10 && !ctx->debug_eos_sent) {
+            blog(LOG_INFO, "[obs-netint-t4xx] DEBUG: Sent %llu frames, now forcing EOS to flush encoder", ctx->frame_count);
+            ctx->debug_eos_sent = true;
+
+            /* Send EOS using the same logic as flushing */
+            blog(LOG_INFO, "[obs-netint-t4xx] DEBUG: Getting EOS frame buffer from encoder FIFO...");
+            int eos_get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
+            if (eos_get_ret != NI_LOGAN_RETCODE_SUCCESS) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] DEBUG: EOS encode_get_frame failed (ret=%d)", eos_get_ret);
+            } else {
+                ni_logan_session_data_io_t *eos_input_fme = (ni_logan_session_data_io_t *)ctx->enc.p_input_fme;
+                if (!eos_input_fme) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] DEBUG: EOS frame buffer is NULL after encode_get_frame!");
+                } else {
+                    ni_logan_frame_t *eos_ni_frame = &eos_input_fme->data.frame;
+
+                    /* Initialize EOS frame metadata */
+                    eos_ni_frame->video_width = ctx->enc.width;
+                    eos_ni_frame->video_height = ctx->enc.height;
+                    eos_ni_frame->pts = 0;  /* EOS timestamp */
+                    eos_ni_frame->dts = 0;
+                    eos_ni_frame->start_of_stream = 0;
+                    eos_ni_frame->end_of_stream = 1;  /* THIS IS THE KEY: End of stream! */
+                    eos_ni_frame->force_key_frame = 0;
+
+                    blog(LOG_INFO, "[obs-netint-t4xx] DEBUG: Sending EOS frame to encoder");
+                    int eos_sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, ctx->enc.p_input_fme,
+                                                                 NI_LOGAN_DEVICE_TYPE_ENCODER);
+                    blog(LOG_INFO, "[obs-netint-t4xx] DEBUG: EOS device_session_write returned: %d", eos_sent);
+                }
+            }
+        }
+
+        /* Let background thread handle packet reception - don't try synchronous here */
+        /* The encoder may need multiple frames before producing output */
+        blog(LOG_INFO, "[obs-netint-t4xx] Frame sent to hardware, background thread will handle packet reception");
+        *received = false;
+
     } else {
-        /* Flushing mode: no more input frames */
+        /* Flushing mode: Send EOS frame to encoder */
+        blog(LOG_INFO, "[obs-netint-t4xx] Flushing encoder - sending EOS frame");
+
+        /* Send an EOS (end of stream) frame using proper sequence */
+        blog(LOG_INFO, "[obs-netint-t4xx] Getting EOS frame buffer from encoder FIFO...");
+        int eos_get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
+        if (eos_get_ret != NI_LOGAN_RETCODE_SUCCESS) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] EOS encode_get_frame failed (ret=%d)", eos_get_ret);
+            return false;
+        }
+
+        /* Get the EOS frame buffer that was allocated by encode_get_frame */
+        ni_logan_session_data_io_t *eos_input_fme = (ni_logan_session_data_io_t *)ctx->enc.p_input_fme;
+        if (!eos_input_fme) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] EOS frame buffer is NULL after encode_get_frame!");
+            return false;
+        }
+        ni_logan_frame_t *eos_ni_frame = &eos_input_fme->data.frame;
+
+        /* Initialize EOS frame metadata */
+        eos_ni_frame->video_width = ctx->enc.width;
+        eos_ni_frame->video_height = ctx->enc.height;
+        eos_ni_frame->pts = 0;  /* EOS timestamp */
+        eos_ni_frame->dts = 0;
+        eos_ni_frame->start_of_stream = 0;
+        eos_ni_frame->end_of_stream = 1;  /* THIS IS THE KEY: End of stream! */
+        eos_ni_frame->force_key_frame = 0;
+
+        blog(LOG_INFO, "[obs-netint-t4xx] Sending EOS frame to encoder");
+
+        /* Send EOS frame using device session write */
+        int eos_sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, ctx->enc.p_input_fme,
+                                                       NI_LOGAN_DEVICE_TYPE_ENCODER);
+
+        /* Note: EOS frame buffer is managed by libxcoder */
+
+        blog(LOG_INFO, "[obs-netint-t4xx] >>> EOS device_session_write returned: %d", eos_sent);
+
+        if (eos_sent < 0) {
+            /* Fatal error - encoder is broken */
+            blog(LOG_ERROR, "[obs-netint-t4xx] EOS frame send failed (ret=%d)", eos_sent);
+            return false;
+        } else if (eos_sent == 0) {
+            /* FIFO full - cannot send EOS yet */
+            /* Keep trying - OBS will call flush again */
+            blog(LOG_WARNING, "[obs-netint-t4xx] Encoder FIFO full, cannot send EOS yet (will retry)");
+            *received = false;
+            return true;
+        }
+
+        blog(LOG_INFO, "[obs-netint-t4xx] ✅ EOS frame sent successfully");
         ctx->flushing = true;
-        blog(LOG_DEBUG, "[obs-netint-t4xx] Flushing encoder (no more frames)");
     }
     
-    /* No packet in queue, frame was sent (or we're flushing) */
-    /* Background thread will queue packets when they arrive */
+    /* ===================================================================
+     * STEP 3: No packets available, return to OBS
+     * ===================================================================
+     *
+     * If we get here, we checked for packets first (and didn't find any),
+     * then sent a frame (if we had one). No packets are ready yet.
+     */
+
+    blog(LOG_INFO, "[obs-netint-t4xx] ◀ netint_encode() returning: received=%d, return=true", *received);
     *received = false;
     return true;
 }
-
-
 /**
  * @brief Set default values for encoder settings
  * 
@@ -1264,6 +1503,8 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
 {
     struct netint_ctx *ctx = data;
     
+    blog(LOG_INFO, "[obs-netint-t4xx] ▶ get_extra_data() called, got_headers=%d", ctx->got_headers);
+    
     /* If headers not available yet, wait for them (up to 5 seconds) */
     /* This handles the case where headers are extracted from the first packet */
     if (!ctx->got_headers) {
@@ -1283,6 +1524,7 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
             blog(LOG_ERROR, "[obs-netint-t4xx] Timeout waiting for encoder headers");
             return false;
         }
+
     }
     
     /* Double-check extradata is valid */
@@ -1290,6 +1532,8 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
         blog(LOG_ERROR, "[obs-netint-t4xx] Headers flag set but extradata is NULL");
         return false;
     }
+    
+    blog(LOG_INFO, "[obs-netint-t4xx] ✅ get_extra_data() returning headers: %zu bytes", ctx->extra_size);
     
     /* Return extradata pointer and size to OBS */
     /* OBS will copy this data if needed, so we don't need to allocate */
@@ -1299,7 +1543,6 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
     blog(LOG_DEBUG, "[obs-netint-t4xx] Returning %zu bytes of header data", *size);
     return true;
 }
-
 /**
  * @name Encoder Registration Structures
  * @brief OBS encoder info structures that define the encoder interface
@@ -1414,5 +1657,9 @@ void netint_register_encoders(void)
     obs_register_encoder(&netint_h264_info);
     obs_register_encoder(&netint_h265_info);
 }
+
+
+
+
 
 

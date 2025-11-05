@@ -192,6 +192,12 @@ typedef struct _ni_logan_encoder_params ni_logan_encoder_params_t;
 
 /** Set encoder parameter value by name (e.g., "cbr", "profile") */
 int (*p_ni_logan_encoder_params_set_value)(ni_logan_encoder_params_t *, const char *, const char *, ni_logan_session_context_t *) = NULL;
+
+/** Set encoder GOP parameter value by name */
+int (*p_ni_logan_encoder_gop_params_set_value)(ni_logan_encoder_params_t *, const char *, const char *, void *) = NULL;
+
+/** Set VUI parameters */
+void (*p_ni_logan_set_vui)(ni_logan_encoder_params_t *, ni_logan_session_context_t *, ni_color_primaries_t, ni_color_transfer_characteristic_t, ni_color_space_t, int, int, int, ni_logan_codec_format_t) = NULL;
 /*@}*/
 
 /**
@@ -383,6 +389,8 @@ bool ni_libxcoder_open(void)
     /* Optional encoder params API - allows runtime parameter adjustment */
     /* If missing, we can't set advanced parameters like CBR/VBR mode dynamically */
     p_ni_logan_encoder_params_set_value = (void *)os_dlsym(s_lib_handle, "ni_logan_encoder_params_set_value");
+    RESOLVE(ni_logan_encoder_gop_params_set_value);
+    RESOLVE(ni_logan_set_vui);
 
     /* Optional logging API - redirect libxcoder logs to OBS logging */
     p_ni_log_set_callback = (void *)os_dlsym(s_lib_handle, "ni_log_set_callback");

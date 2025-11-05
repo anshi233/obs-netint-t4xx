@@ -75,7 +75,72 @@ typedef enum {
  * @brief Forward declarations for types used in frame/packet structures
  */
 typedef enum { NI_LOGAN_CODEC_FORMAT_H264 = 0, NI_LOGAN_CODEC_FORMAT_H265 = 1 } ni_logan_codec_format_t;
-typedef enum { NI_LOGAN_PIC_TYPE_I = 0, NI_LOGAN_PIC_TYPE_P = 1 } ni_logan_pic_type_t;
+typedef enum { NI_LOGAN_PIC_TYPE_I = 0, NI_LOGAN_PIC_TYPE_P = 1, LOGAN_PIC_TYPE_IDR = 2 } ni_logan_pic_type_t;
+
+/* Frame type constants for packet metadata */
+typedef enum {
+    NI_LOGAN_FRAME_TYPE_I = 0,
+    NI_LOGAN_FRAME_TYPE_P = 1,
+    NI_LOGAN_FRAME_TYPE_B = 2
+} ni_logan_frame_type_t;
+
+/* Color space enums for VUI */
+typedef enum {
+    NI_COL_PRI_RESERVED0   = 0,
+    NI_COL_PRI_BT709       = 1,
+    NI_COL_PRI_UNSPECIFIED = 2,
+    NI_COL_PRI_RESERVED    = 3,
+    NI_COL_PRI_BT470M      = 4,
+    NI_COL_PRI_BT470BG     = 5,
+    NI_COL_PRI_SMPTE170M   = 6,
+    NI_COL_PRI_SMPTE240M   = 7,
+    NI_COL_PRI_FILM        = 8,
+    NI_COL_PRI_BT2020      = 9,
+    NI_COL_PRI_SMPTE428    = 10,
+    NI_COL_PRI_SMPTE431    = 11,
+    NI_COL_PRI_SMPTE432    = 12,
+    NI_COL_PRI_JEDEC_P22   = 22,
+} ni_color_primaries_t;
+
+typedef enum {
+    NI_COL_TRC_RESERVED0    = 0,
+    NI_COL_TRC_BT709        = 1,
+    NI_COL_TRC_UNSPECIFIED  = 2,
+    NI_COL_TRC_RESERVED     = 3,
+    NI_COL_TRC_GAMMA22      = 4,
+    NI_COL_TRC_GAMMA28      = 5,
+    NI_COL_TRC_SMPTE170M    = 6,
+    NI_COL_TRC_SMPTE240M    = 7,
+    NI_COL_TRC_LINEAR       = 8,
+    NI_COL_TRC_LOG          = 9,
+    NI_COL_TRC_LOG_SQRT     = 10,
+    NI_COL_TRC_IEC61966_2_4 = 11,
+    NI_COL_TRC_BT1361_ECG   = 12,
+    NI_COL_TRC_IEC61966_2_1 = 13,
+    NI_COL_TRC_BT2020_10    = 14,
+    NI_COL_TRC_BT2020_12    = 15,
+    NI_COL_TRC_SMPTE2084    = 16,
+    NI_COL_TRC_SMPTE428     = 17,
+    NI_COL_TRC_ARIB_STD_B67 = 18,
+} ni_color_transfer_characteristic_t;
+
+typedef enum {
+    NI_COL_SPC_RGB         = 0,
+    NI_COL_SPC_BT709       = 1,
+    NI_COL_SPC_UNSPECIFIED = 2,
+    NI_COL_SPC_RESERVED    = 3,
+    NI_COL_SPC_FCC         = 4,
+    NI_COL_SPC_BT470BG     = 5,
+    NI_COL_SPC_SMPTE170M   = 6,
+    NI_COL_SPC_SMPTE240M   = 7,
+    NI_COL_SPC_YCGCO       = 8,
+    NI_COL_SPC_BT2020_NCL  = 9,
+    NI_COL_SPC_BT2020_CL   = 10,
+    NI_COL_SPC_SMPTE2085   = 11,
+    NI_COL_SPC_CHROMA_DERIVED_NCL = 12,
+    NI_COL_SPC_CHROMA_DERIVED_CL  = 13,
+    NI_COL_SPC_ICTCP       = 14,
+} ni_color_space_t;
 typedef struct _ni_logan_buf ni_logan_buf_t;
 typedef struct _ni_aux_data ni_aux_data_t;
 typedef struct _ni_logan_all_custom_sei ni_logan_all_custom_sei_t;

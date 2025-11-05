@@ -23,6 +23,9 @@
 
 #pragma once
 
+#ifndef NETINT_LIBXCODER_H
+#define NETINT_LIBXCODER_H
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -172,6 +175,21 @@ typedef struct _ni_logan_encoder_params ni_logan_encoder_params_t;
 
 /** Set encoder parameter value by name (e.g., "cbr", "profile") */
 extern int (*p_ni_logan_encoder_params_set_value)(ni_logan_encoder_params_t *, const char *, const char *, ni_logan_session_context_t *);
+
+/** Set encoder GOP parameter value by name */
+extern int (*p_ni_logan_encoder_gop_params_set_value)(ni_logan_encoder_params_t *, const char *, const char *, void *);
+
+/** Set VUI parameters */
+extern void (*p_ni_logan_set_vui)(ni_logan_encoder_params_t *, ni_logan_session_context_t *, ni_color_primaries_t, ni_color_transfer_characteristic_t, ni_color_space_t, int, int, int, ni_logan_codec_format_t);
 /*@}*/
 
+/**
+ * @name Encoder Parameter Name Constants
+ * @brief String constants for encoder parameter names (from ni_device_api_logan.h)
+ */
+/*@{*/
+#define NI_LOGAN_ENC_PARAM_GOP_PRESET_IDX                 "gopPresetIdx"
+#define NI_LOGAN_ENC_PARAM_INTRA_PERIOD                   "intraPeriod"
+/*@}*/
 
+#endif /* NETINT_LIBXCODER_H */
