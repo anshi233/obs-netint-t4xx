@@ -173,7 +173,7 @@ struct netint_ctx {
 };
 
 /**
- * @brief Get the display name for this encoder type
+ * @brief Get the display name for this encoder
  * 
  * This function is called by OBS Studio to display the encoder name in the UI.
  * The name appears in the encoder selection dropdown menu.
@@ -367,29 +367,22 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->enc.timebase_den = (int)voi->fps_num;
     ctx->enc.ticks_per_frame = 1;
     
-    /* Codec selection: determine whether to use H.264 or H.265 */
-    /* Priority: 1) settings codec, 2) encoder codec type, 3) default to H.264 */
+    /* Codec selection: User can choose H.264 or H.265 from dropdown */
     const char *codec_str = obs_data_get_string(settings, "codec");
     
-    /* If codec not set in settings, determine from encoder codec type */
-    /* OBS creates separate encoder instances for H.264 vs H.265, so we can infer */
-    if (!codec_str || *codec_str == '\0') {
-        const char *encoder_codec = obs_encoder_get_codec(encoder);
-        if (encoder_codec && strcmp(encoder_codec, "hevc") == 0) {
-            codec_str = "h265";
-        } else {
-            codec_str = "h264";
-        }
-    }
+    blog(LOG_INFO, "[obs-netint-t4xx] Codec setting from user: '%s'", 
+         codec_str ? codec_str : "(null)");
     
     /* Set codec format based on codec selection */
     /* Store codec type in context for later use (keyframe detection, packet parsing) */
     if (codec_str && strcmp(codec_str, "h265") == 0) {
         ctx->codec_type = 1; /* H.265 (HEVC) */
         ctx->enc.codec_format = 1; /* NI_LOGAN_CODEC_FORMAT_H265 */
+        blog(LOG_INFO, "[obs-netint-t4xx] Codec selected: H.265 (HEVC) - codec_type=1, codec_format=1");
     } else {
         ctx->codec_type = 0; /* H.264 (AVC) */
         ctx->enc.codec_format = 0; /* NI_LOGAN_CODEC_FORMAT_H264 */
+        blog(LOG_INFO, "[obs-netint-t4xx] Codec selected: H.264 (AVC) - codec_type=0, codec_format=0");
     }
     
     /* Set pixel format - currently only YUV420P is supported */
@@ -541,6 +534,10 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         
         int gop_ret = p_ni_logan_encoder_params_set_value(params, "gopPresetIdx", gop_value, session_ctx);
         blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s: ret=%d", gop_desc, gop_ret);
+
+        /* CRITICAL: Enable rate control first! Without this, encoder uses Constant QP mode and ignores bitrate! */
+        p_ni_logan_encoder_params_set_value(params, "RcEnable", "1", session_ctx);
+        blog(LOG_INFO, "[obs-netint-t4xx] Rate control ENABLED (RcEnable=1)");
 
         /* Set rate control mode: CBR (constant) or VBR (variable) */
         /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
@@ -1541,8 +1538,7 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 }
 static void netint_get_defaults(obs_data_t *settings)
 {
-    /* Default codec will be set based on encoder codec type in netint_create */
-    /* This default is used if codec isn't explicitly set in settings */
+    /* Default codec: H.264 (will be shown in dropdown, user can change to H.265) */
     obs_data_set_default_string(settings, "codec", "h264");
     
     /* Default bitrate: 6000 kbps (good for 1080p streaming) */
@@ -1596,8 +1592,8 @@ static obs_properties_t *netint_get_properties(void *data)
     
     /* Codec selection dropdown - H.264 or H.265 */
     obs_property_t *codec_prop = obs_properties_add_list(props, "codec", "Codec", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-    obs_property_list_add_string(codec_prop, "h264", "H.264");
-    obs_property_list_add_string(codec_prop, "h265", "H.265");
+    obs_property_list_add_string(codec_prop, "H.264", "h264");
+    obs_property_list_add_string(codec_prop, "H.265", "h265");
     
     /* Bitrate input: 100-100000 kbps, step size 50 kbps */
     obs_properties_add_int(props, "bitrate", "Bitrate (kbps)", 100, 100000, 50);
