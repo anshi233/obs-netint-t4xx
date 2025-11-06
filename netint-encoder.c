@@ -173,18 +173,33 @@ struct netint_ctx {
 };
 
 /**
- * @brief Get the display name for this encoder
+ * @brief Get the display name for H.264 encoder
  * 
  * This function is called by OBS Studio to display the encoder name in the UI.
  * The name appears in the encoder selection dropdown menu.
  * 
  * @param type_data Unused - OBS encoder type data (not used in this implementation)
- * @return Static string "NETINT T4XX" - the display name for this encoder
+ * @return Static string "NETINT T4XX H.264" - the display name for this encoder
  */
-static const char *netint_get_name(void *type_data)
+static const char *netint_h264_get_name(void *type_data)
 {
     UNUSED_PARAMETER(type_data);
-    return "NETINT T4XX";
+    return "NETINT T4XX H.264";
+}
+
+/**
+ * @brief Get the display name for H.265 encoder
+ * 
+ * This function is called by OBS Studio to display the encoder name in the UI.
+ * The name appears in the encoder selection dropdown menu.
+ * 
+ * @param type_data Unused - OBS encoder type data (not used in this implementation)
+ * @return Static string "NETINT T4XX H.265" - the display name for this encoder
+ */
+static const char *netint_h265_get_name(void *type_data)
+{
+    UNUSED_PARAMETER(type_data);
+    return "NETINT T4XX H.265";
 }
 
 /* Forward declarations */
@@ -367,15 +382,16 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->enc.timebase_den = (int)voi->fps_num;
     ctx->enc.ticks_per_frame = 1;
     
-    /* Codec selection: User can choose H.264 or H.265 from dropdown */
-    const char *codec_str = obs_data_get_string(settings, "codec");
+    /* Codec selection: Determined by which encoder registration OBS used */
+    /* OBS will call the appropriate create function based on encoder ID */
+    const char *codec_str = obs_encoder_get_codec(encoder);
     
-    blog(LOG_INFO, "[obs-netint-t4xx] Codec setting from user: '%s'", 
+    blog(LOG_INFO, "[obs-netint-t4xx] Codec from OBS encoder registration: '%s'", 
          codec_str ? codec_str : "(null)");
     
-    /* Set codec format based on codec selection */
+    /* Set codec format based on OBS encoder registration */
     /* Store codec type in context for later use (keyframe detection, packet parsing) */
-    if (codec_str && strcmp(codec_str, "h265") == 0) {
+    if (codec_str && strcmp(codec_str, "hevc") == 0) {
         ctx->codec_type = 1; /* H.265 (HEVC) */
         ctx->enc.codec_format = 1; /* NI_LOGAN_CODEC_FORMAT_H265 */
         blog(LOG_INFO, "[obs-netint-t4xx] Codec selected: H.265 (HEVC) - codec_type=1, codec_format=1");
@@ -557,15 +573,26 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         if (ctx->profile) {
             const char *profile_id_str = NULL;
             if (ctx->codec_type == 1) {
-                /* H.265 (HEVC) profiles - profile IDs from HEVC spec */
-                if (strcmp(ctx->profile, "baseline") == 0 || strcmp(ctx->profile, "main") == 0) {
-                    profile_id_str = "1"; /* HEVC Main profile (8-bit) */
-                } else if (strcmp(ctx->profile, "high") == 0) {
-                    profile_id_str = "2"; /* HEVC Main 10 profile (10-bit) */
-                }
+                /* H.265 (HEVC) - NETINT-specific profile IDs
+                 * CRITICAL: NETINT H.265 encoder ONLY supports 2 profiles:
+                 *   Profile 1 = Main (8-bit)
+                 *   Profile 2 = Main10 (10-bit ONLY)
+                 * 
+                 * H.265 standard does NOT have a "high" profile like H.264!
+                 * According to NETINT Integration Guide section 6.6:
+                 *   "Any profile can be used for 8 bit encoding but only the 
+                 *    10 bit profiles (main10 for H.265) may be used for 10 bit encoding"
+                 * 
+                 * For 8-bit encoding (bit_depth_factor=1), we MUST use Profile 1 (Main)
+                 * Using Profile 2 (Main10) for 8-bit creates corrupted headers!
+                 */
+                profile_id_str = "1"; /* Always use Main profile (ID=1) for 8-bit H.265 */
+                blog(LOG_INFO, "[obs-netint-t4xx] H.265 8-bit encoding: Profile '%s' mapped to Main (ID=1)", 
+                     ctx->profile);
         } else {
             /* H.264 profiles - libxcoder expects enum values, NOT H.264 spec profile_idc! */
-            /* From library error: 1=baseline, 2=main, 3=extended, 4=high, 5=high10 */
+            /* From NETINT Integration Guide section 6.6:
+             *   1=baseline, 2=main, 3=extended, 4=high, 5=high10 */
             if (strcmp(ctx->profile, "baseline") == 0) {
                 profile_id_str = "1"; /* Baseline profile (enum value) */
             } else if (strcmp(ctx->profile, "main") == 0) {
@@ -925,6 +952,74 @@ static void *netint_recv_thread(void *data)
             /* Extract headers from first packet if not already done */
             if (!ctx->got_headers) {
                 blog(LOG_INFO, "[obs-netint-t4xx] [RECV THREAD] Extracting headers from first packet (%zu bytes)", pkt->size);
+                
+                /* DIAGNOSTIC: Dump first 64 bytes of header for analysis */
+                blog(LOG_INFO, "[obs-netint-t4xx] [RECV THREAD] Header hex dump (first %d bytes):", 
+                     pkt->size < 64 ? (int)pkt->size : 64);
+                for (size_t i = 0; i < pkt->size && i < 64; i += 16) {
+                    char hex_buf[128] = {0};
+                    char *p = hex_buf;
+                    size_t end = (i + 16 < pkt->size) ? i + 16 : pkt->size;
+                    for (size_t j = i; j < end && j < 64; j++) {
+                        p += sprintf(p, "%02X ", pkt->data[j]);
+                    }
+                    blog(LOG_INFO, "[obs-netint-t4xx]   %04zX: %s", i, hex_buf);
+                }
+                
+                /* Analyze NAL unit types to detect actual codec */
+                bool has_h265_nal = false;
+                bool has_h264_nal = false;
+                
+                for (size_t i = 0; i < pkt->size - 4; i++) {
+                    /* Look for start codes: 00 00 00 01 or 00 00 01 */
+                    if (pkt->data[i] == 0 && pkt->data[i+1] == 0) {
+                        size_t nal_start = 0;
+                        if (pkt->data[i+2] == 0 && pkt->data[i+3] == 1) {
+                            nal_start = i + 4;  /* 4-byte start code */
+                        } else if (pkt->data[i+2] == 1) {
+                            nal_start = i + 3;  /* 3-byte start code */
+                        }
+                        
+                        if (nal_start > 0 && nal_start < pkt->size) {
+                            uint8_t nal_byte = pkt->data[nal_start];
+                            
+                            /* H.265 NAL unit type is in bits 1-6 (mask 0x7E, shift right 1) */
+                            uint8_t h265_type = (nal_byte >> 1) & 0x3F;
+                            
+                            /* H.264 NAL unit type is in bits 0-4 (mask 0x1F) */
+                            uint8_t h264_type = nal_byte & 0x1F;
+                            
+                            blog(LOG_INFO, "[obs-netint-t4xx]   NAL at offset %zu: byte=0x%02X, H.265_type=%u, H.264_type=%u", 
+                                 nal_start, nal_byte, h265_type, h264_type);
+                            
+                            /* H.265 VPS=32, SPS=33, PPS=34 */
+                            if (h265_type >= 32 && h265_type <= 34) {
+                                has_h265_nal = true;
+                                blog(LOG_INFO, "[obs-netint-t4xx]   ✅ H.265 NAL detected: %s", 
+                                     h265_type == 32 ? "VPS" : h265_type == 33 ? "SPS" : "PPS");
+                            }
+                            
+                            /* H.264 SPS=7, PPS=8 */
+                            if (h264_type == 7 || h264_type == 8) {
+                                has_h264_nal = true;
+                                blog(LOG_INFO, "[obs-netint-t4xx]   ⚠️  H.264 NAL detected: %s", 
+                                     h264_type == 7 ? "SPS" : "PPS");
+                            }
+                        }
+                    }
+                }
+                
+                if (has_h265_nal && !has_h264_nal) {
+                    blog(LOG_INFO, "[obs-netint-t4xx] ✅ Headers are H.265 (HEVC) - codec is working correctly!");
+                } else if (has_h264_nal && !has_h265_nal) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] ❌ CRITICAL: Headers are H.264 but H.265 was requested!");
+                    blog(LOG_ERROR, "[obs-netint-t4xx] ❌ Hardware encoder is producing wrong codec!");
+                } else if (has_h265_nal && has_h264_nal) {
+                    blog(LOG_WARNING, "[obs-netint-t4xx] ⚠️  Mixed H.264/H.265 NALs detected - unusual!");
+                } else {
+                    blog(LOG_WARNING, "[obs-netint-t4xx] ⚠️  Could not identify codec from headers");
+                }
+                
                 if (ctx->extra) bfree(ctx->extra);
                 ctx->extra = bmemdup(pkt->data, pkt->size);
                 ctx->extra_size = pkt->size;
@@ -1538,8 +1633,8 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 }
 static void netint_get_defaults(obs_data_t *settings)
 {
-    /* Default codec: H.264 (will be shown in dropdown, user can change to H.265) */
-    obs_data_set_default_string(settings, "codec", "h264");
+    /* NOTE: Codec is NOT a setting anymore - it's determined by which encoder the user selects */
+    /* OBS will create either obs_netint_t4xx_h264 or obs_netint_t4xx_h265 based on user's choice */
     
     /* Default bitrate: 6000 kbps (good for 1080p streaming) */
     obs_data_set_default_int(settings, "bitrate", 6000);
@@ -1569,13 +1664,17 @@ static void netint_get_defaults(obs_data_t *settings)
  * dropdowns, checkboxes) for each setting.
  * 
  * Properties Created:
- * - codec: Dropdown list (H.264 or H.265)
  * - bitrate: Integer input (100-100000 kbps, step 50)
  * - keyint: Integer input (1-20 seconds, step 1)
  * - device: Text input or dropdown (auto-populated if discovery available)
  * - rc_mode: Dropdown list (CBR or VBR)
  * - profile: Dropdown list (baseline, main, high)
  * - repeat_headers: Checkbox (attach SPS/PPS to every keyframe)
+ * 
+ * NOTE: Codec selection (H.264 vs H.265) is done by selecting the encoder in OBS:
+ * - "NETINT T4XX H.264" for H.264 encoding
+ * - "NETINT T4XX H.265" for H.265 encoding
+ * This matches how NVENC works and ensures proper codec detection by MP4 muxer.
  * 
  * Device Discovery:
  * - If device discovery APIs are available, populate device dropdown
@@ -1590,10 +1689,8 @@ static obs_properties_t *netint_get_properties(void *data)
     UNUSED_PARAMETER(data);
     obs_properties_t *props = obs_properties_create();
     
-    /* Codec selection dropdown - H.264 or H.265 */
-    obs_property_t *codec_prop = obs_properties_add_list(props, "codec", "Codec", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-    obs_property_list_add_string(codec_prop, "H.264", "h264");
-    obs_property_list_add_string(codec_prop, "H.265", "h265");
+    /* NOTE: Codec dropdown removed - user selects encoder type in OBS instead */
+    /* This ensures MP4 muxer correctly identifies codec type from encoder registration */
     
     /* Bitrate input: 100-100000 kbps, step size 50 kbps */
     obs_properties_add_int(props, "bitrate", "Bitrate (kbps)", 100, 100000, 50);
@@ -1759,13 +1856,13 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
  * new optional callbacks to the structure in future versions.
  */
 /*@{*/
-/** H.264 encoder registration - appears as "NETINT T4XX" in encoder list */
+/** H.264 encoder registration - appears as "NETINT T4XX H.264" in encoder list */
 static struct obs_encoder_info netint_h264_info = {
     .id = "obs_netint_t4xx_h264",      /**< Unique identifier for this encoder */
     .codec = "h264",                   /**< Codec string (matches OBS codec type) */
     .type = OBS_ENCODER_VIDEO,        /**< Encoder type: video encoder */
     .caps = 0,                         /**< Capability flags - see documentation above */
-    .get_name = netint_get_name,
+    .get_name = netint_h264_get_name,  /**< Returns "NETINT T4XX H.264" */
     .create = netint_create,
     .destroy = netint_destroy,
     .update = netint_update,
@@ -1779,13 +1876,13 @@ static struct obs_encoder_info netint_h264_info = {
     .get_video_info = netint_get_video_info,  /**< Request I420 format from OBS */
 };
 
-/** H.265 (HEVC) encoder registration - appears as "NETINT T4XX" in encoder list */
+/** H.265 (HEVC) encoder registration - appears as "NETINT T4XX H.265" in encoder list */
 static struct obs_encoder_info netint_h265_info = {
     .id = "obs_netint_t4xx_h265",      /**< Unique identifier for this encoder */
     .codec = "hevc",                   /**< Codec string (OBS uses "hevc" for H.265) */
     .type = OBS_ENCODER_VIDEO,        /**< Encoder type: video encoder */
     .caps = 0,                         /**< Capability flags - see documentation above */
-    .get_name = netint_get_name,
+    .get_name = netint_h265_get_name,  /**< Returns "NETINT T4XX H.265" */
     .create = netint_create,
     .destroy = netint_destroy,
     .update = netint_update,
