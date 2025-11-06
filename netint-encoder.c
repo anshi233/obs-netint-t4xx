@@ -1055,7 +1055,8 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
 {
     blog(LOG_INFO, "[obs-netint-t4xx] Processing batch of %d frames like xcoder_logan", ctx->frame_buffer.count);
 
-    /* Send all buffered frames to the encoder */
+    /* Send all buffered frames to the encoder using LOW-LEVEL API like xcoder */
+    /* XCoder uses device_session_write with stack-allocated session_data_io_t, NOT FIFO APIs! */
     for (int i = 0; i < ctx->frame_buffer.count; i++) {
         struct encoder_frame *frame = (struct encoder_frame *)ctx->frame_buffer.frames[i];
 
@@ -1066,28 +1067,21 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
         int width = ctx->enc.width;
         int height = ctx->enc.height;
 
-        /* STEP 1: Get frame buffer from encoder FIFO */
-        int get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
-        if (get_ret != NI_LOGAN_RETCODE_SUCCESS) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] encode_get_frame failed (ret=%d)", get_ret);
-            return false;
-        }
-
-        /* Get the frame buffer that was allocated by encode_get_frame */
-        ni_logan_session_data_io_t *input_fme = (ni_logan_session_data_io_t *)ctx->enc.p_input_fme;
-        if (!input_fme) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] Frame buffer is NULL after encode_get_frame!");
-            return false;
-        }
-        ni_logan_frame_t *ni_frame = &input_fme->data.frame;
+        /* Allocate our own session_data_io_t on stack (like xcoder) */
+        ni_logan_session_data_io_t input_data = {0};
+        ni_logan_frame_t *ni_frame = &input_data.data.frame;
 
         /* Allocate frame data buffers */
         int dst_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
         int dst_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
         p_ni_logan_get_hw_yuv420p_dim(width, height, 1, (ctx->codec_type == 0) ? 1 : 0, dst_stride, dst_height);
 
+        /* Set extra_data_len BEFORE allocation (xcoder does this) */
+        ni_frame->extra_data_len = 64;  /* NI_LOGAN_APP_ENC_FRAME_META_DATA_SIZE - REQUIRED! */
+
         int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
-                                                               dst_stride, (ctx->codec_type == 0) ? 1 : 0, 0);
+                                                               dst_stride, (ctx->codec_type == 0) ? 1 : 0, 
+                                                               ni_frame->extra_data_len);
         if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
             blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame data buffers (ret=%d)", alloc_ret);
             return false;
@@ -1100,24 +1094,16 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
         ni_frame->dts = 0;
         ni_frame->start_of_stream = (ctx->frame_count == 0) ? 1 : 0;
         ni_frame->end_of_stream = 0;
-        ni_frame->extra_data_len = 64;  /* NI_LOGAN_APP_ENC_FRAME_META_DATA_SIZE - REQUIRED! */
 
-        /* Set keyframe properties based on keyframe interval */
+        /* Set keyframe properties */
         int is_keyframe = (ctx->frame_count == 0);  /* Only force keyframe on first frame */
         ni_frame->force_key_frame = is_keyframe ? 1 : 0;
-        ni_frame->ni_logan_pict_type = is_keyframe ? LOGAN_PIC_TYPE_IDR : 0;  /* 0 for auto, not forcing P */
-
-        /* Log frame parameters before sending - compare with xcoder trace */
-        blog(LOG_INFO, "[obs-netint-t4xx] Frame params: video=%dx%d, pts=%lld, dts=%lld, sos=%d, eos=%d, "
-             "data_len=%u/%u/%u, extra_len=%u, force_key=%u, pict_type=%u",
-             ni_frame->video_width, ni_frame->video_height, (long long)ni_frame->pts, (long long)ni_frame->dts,
-             ni_frame->start_of_stream, ni_frame->end_of_stream,
-             ni_frame->data_len[0], ni_frame->data_len[1], ni_frame->data_len[2],
-             ni_frame->extra_data_len, ni_frame->force_key_frame, ni_frame->ni_logan_pict_type);
+        ni_frame->ni_logan_pict_type = is_keyframe ? LOGAN_PIC_TYPE_IDR : 0;  /* 0 for auto */
 
         /* Copy YUV data directly to the allocated frame buffer */
         if (!ni_frame->p_data[0]) {
             blog(LOG_ERROR, "[obs-netint-t4xx] Frame buffer p_data[0] is NULL!");
+            p_ni_logan_frame_buffer_free(ni_frame);
             return false;
         }
 
@@ -1133,28 +1119,40 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
                                     width, height, 1,
                                     dst_stride, dst_height, src_stride, src_stride);
 
-        /* Send frame using device session write */
-        int sent;
-        int fifo_retry_count = 0;
-        const int max_fifo_retries = 50;
-
-        do {
-            sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, ctx->enc.p_input_fme,
+        /* Send frame using LOW-LEVEL device_session_write (like xcoder) - NO FIFO! */
+        int sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, &input_data,
                                                     NI_LOGAN_DEVICE_TYPE_ENCODER);
 
-            if (sent < 0) {
-                blog(LOG_ERROR, "[obs-netint-t4xx] device_session_write failed (ret=%d)", sent);
-                return false;
-            } else if (sent == 0) {
-                fifo_retry_count++;
-                if (fifo_retry_count >= max_fifo_retries) {
-                    blog(LOG_WARNING, "[obs-netint-t4xx] FIFO still full after %d retries, skipping frame", max_fifo_retries);
+        if (sent < 0) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] device_session_write failed (ret=%d)", sent);
+            p_ni_logan_frame_buffer_free(ni_frame);
+            return false;
+        } else if (sent == 0) {
+            /* Hardware FIFO full - retry with delay */
+            blog(LOG_WARNING, "[obs-netint-t4xx] Hardware FIFO full, retrying frame %d", i+1);
+            int retry_count = 0;
+            const int max_retries = 100;
+            do {
+                os_sleep_ms(10);
+                sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, &input_data,
+                                                        NI_LOGAN_DEVICE_TYPE_ENCODER);
+                retry_count++;
+                if (retry_count >= max_retries) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Hardware FIFO still full after %d retries", max_retries);
+                    p_ni_logan_frame_buffer_free(ni_frame);
                     return false;
                 }
-                blog(LOG_DEBUG, "[obs-netint-t4xx] FIFO full, retrying in 10ms (attempt %d/%d)", fifo_retry_count, max_fifo_retries);
-                os_sleep_ms(10);
+            } while (sent == 0);
+            
+            if (sent < 0) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] device_session_write failed after retry (ret=%d)", sent);
+                p_ni_logan_frame_buffer_free(ni_frame);
+                return false;
             }
-        } while (sent == 0);
+        }
+
+        /* Free the frame buffer after sending (xcoder pattern) */
+        p_ni_logan_frame_buffer_free(ni_frame);
 
         blog(LOG_INFO, "[obs-netint-t4xx] Frame %d/%d sent successfully (PTS=%lld, sent=%d bytes)",
              i+1, ctx->frame_buffer.count, (long long)frame->pts, sent);
