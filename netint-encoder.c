@@ -568,39 +568,38 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         }
         
         /* Set encoder profile - maps string names to codec-specific profile IDs */
-        /* Profile determines feature set: baseline < main < high */
+        /* Profile determines feature set and bit depth support */
         /* Profile IDs differ between H.264 and H.265 */
         if (ctx->profile) {
             const char *profile_id_str = NULL;
             if (ctx->codec_type == 1) {
                 /* H.265 (HEVC) - NETINT-specific profile IDs
-                 * CRITICAL: NETINT H.265 encoder ONLY supports 2 profiles:
+                 * From NETINT Integration Guide section 6.6:
                  *   Profile 1 = Main (8-bit)
-                 *   Profile 2 = Main10 (10-bit ONLY)
+                 *   Profile 2 = Main10 (10-bit)
                  * 
-                 * H.265 standard does NOT have a "high" profile like H.264!
-                 * According to NETINT Integration Guide section 6.6:
-                 *   "Any profile can be used for 8 bit encoding but only the 
-                 *    10 bit profiles (main10 for H.265) may be used for 10 bit encoding"
-                 * 
-                 * For 8-bit encoding (bit_depth_factor=1), we MUST use Profile 1 (Main)
-                 * Using Profile 2 (Main10) for 8-bit creates corrupted headers!
+                 * "Any profile can be used for 8 bit encoding but only the 
+                 *  10 bit profiles (main10 for H.265) may be used for 10 bit encoding"
                  */
-                profile_id_str = "1"; /* Always use Main profile (ID=1) for 8-bit H.265 */
-                blog(LOG_INFO, "[obs-netint-t4xx] H.265 8-bit encoding: Profile '%s' mapped to Main (ID=1)", 
-                     ctx->profile);
-        } else {
-            /* H.264 profiles - libxcoder expects enum values, NOT H.264 spec profile_idc! */
-            /* From NETINT Integration Guide section 6.6:
-             *   1=baseline, 2=main, 3=extended, 4=high, 5=high10 */
-            if (strcmp(ctx->profile, "baseline") == 0) {
-                profile_id_str = "1"; /* Baseline profile (enum value) */
-            } else if (strcmp(ctx->profile, "main") == 0) {
-                profile_id_str = "2"; /* Main profile (enum value) */
-            } else if (strcmp(ctx->profile, "high") == 0) {
-                profile_id_str = "4"; /* High profile (enum value) */
+                if (strcmp(ctx->profile, "main10") == 0) {
+                    profile_id_str = "2"; /* Main10 profile (ID=2) for 10-bit */
+                    blog(LOG_INFO, "[obs-netint-t4xx] H.265 Profile: Main10 (ID=2) - 10-bit encoding");
+                } else {
+                    profile_id_str = "1"; /* Main profile (ID=1) for 8-bit */
+                    blog(LOG_INFO, "[obs-netint-t4xx] H.265 Profile: Main (ID=1) - 8-bit encoding");
+                }
+            } else {
+                /* H.264 profiles - libxcoder expects enum values, NOT H.264 spec profile_idc! */
+                /* From NETINT Integration Guide section 6.6:
+                 *   1=baseline, 2=main, 3=extended, 4=high, 5=high10 */
+                if (strcmp(ctx->profile, "baseline") == 0) {
+                    profile_id_str = "1"; /* Baseline profile (enum value) */
+                } else if (strcmp(ctx->profile, "main") == 0) {
+                    profile_id_str = "2"; /* Main profile (enum value) */
+                } else if (strcmp(ctx->profile, "high") == 0) {
+                    profile_id_str = "4"; /* High profile (enum value) */
+                }
             }
-        }
             if (profile_id_str) {
                 p_ni_logan_encoder_params_set_value(params, "profile", profile_id_str, session_ctx);
                 blog(LOG_INFO, "[obs-netint-t4xx] Profile set to: %s (ID=%s)", ctx->profile, profile_id_str);
@@ -1631,11 +1630,11 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
         return netint_encode_flush(ctx, packet, received);
     }
 }
-static void netint_get_defaults(obs_data_t *settings)
+/**
+ * @brief Set default values for H.264 encoder settings
+ */
+static void netint_h264_get_defaults(obs_data_t *settings)
 {
-    /* NOTE: Codec is NOT a setting anymore - it's determined by which encoder the user selects */
-    /* OBS will create either obs_netint_t4xx_h264 or obs_netint_t4xx_h265 based on user's choice */
-    
     /* Default bitrate: 6000 kbps (good for 1080p streaming) */
     obs_data_set_default_int(settings, "bitrate", 6000);
     
@@ -1645,7 +1644,7 @@ static void netint_get_defaults(obs_data_t *settings)
     /* Default rate control: CBR (constant bitrate) - better for streaming */
     obs_data_set_default_string(settings, "rc_mode", "CBR");
     
-    /* Default profile: high (best quality, supports all encoder features) */
+    /* Default profile: high (best quality for H.264) */
     obs_data_set_default_string(settings, "profile", "high");
     
     /* Default GOP preset: default (I-B-B-B-P pattern with B-frames for best quality) */
@@ -1657,40 +1656,50 @@ static void netint_get_defaults(obs_data_t *settings)
 }
 
 /**
- * @brief Create properties UI for encoder settings
+ * @brief Set default values for H.265 encoder settings
+ */
+static void netint_h265_get_defaults(obs_data_t *settings)
+{
+    /* Default bitrate: 6000 kbps (good for 1080p recording) */
+    obs_data_set_default_int(settings, "bitrate", 6000);
+    
+    /* Default keyframe interval: 2 seconds (auto-calculated from FPS if <= 0) */
+    obs_data_set_default_int(settings, "keyint", 2);
+    
+    /* Default rate control: CBR (constant bitrate) */
+    obs_data_set_default_string(settings, "rc_mode", "CBR");
+    
+    /* Default profile: main (standard 8-bit H.265 profile) */
+    obs_data_set_default_string(settings, "profile", "main");
+    
+    /* Default GOP preset: default (I-B-B-B-P pattern with B-frames for best quality) */
+    obs_data_set_default_string(settings, "gop_preset", "default");
+    
+    /* Default repeat headers: true (attach VPS/SPS/PPS to every keyframe) */
+    /* This is important for streaming where clients may join mid-stream */
+    obs_data_set_default_bool(settings, "repeat_headers", true);
+}
+
+/**
+ * @brief Create properties UI for H.264 encoder settings
  * 
- * This function is called by OBS Studio to create the settings UI that appears
- * when the user configures the encoder. It creates all the UI controls (text boxes,
- * dropdowns, checkboxes) for each setting.
+ * This function creates the settings UI for the H.264 encoder with H.264-specific options.
  * 
  * Properties Created:
  * - bitrate: Integer input (100-100000 kbps, step 50)
  * - keyint: Integer input (1-20 seconds, step 1)
  * - device: Text input or dropdown (auto-populated if discovery available)
  * - rc_mode: Dropdown list (CBR or VBR)
- * - profile: Dropdown list (baseline, main, high)
+ * - profile: Dropdown list (baseline, main, high) - H.264 profiles
  * - repeat_headers: Checkbox (attach SPS/PPS to every keyframe)
  * 
- * NOTE: Codec selection (H.264 vs H.265) is done by selecting the encoder in OBS:
- * - "NETINT T4XX H.264" for H.264 encoding
- * - "NETINT T4XX H.265" for H.265 encoding
- * This matches how NVENC works and ensures proper codec detection by MP4 muxer.
- * 
- * Device Discovery:
- * - If device discovery APIs are available, populate device dropdown
- * - Otherwise, device is a text input field for manual entry
- * - Discovery happens at property creation time (not dynamic)
- * 
- * @param data Encoder context (unused - properties are the same for all instances)
+ * @param data Encoder context (unused)
  * @return OBS properties object containing all UI controls
  */
-static obs_properties_t *netint_get_properties(void *data)
+static obs_properties_t *netint_h264_get_properties(void *data)
 {
     UNUSED_PARAMETER(data);
     obs_properties_t *props = obs_properties_create();
-    
-    /* NOTE: Codec dropdown removed - user selects encoder type in OBS instead */
-    /* This ensures MP4 muxer correctly identifies codec type from encoder registration */
     
     /* Bitrate input: 100-100000 kbps, step size 50 kbps */
     obs_properties_add_int(props, "bitrate", "Bitrate (kbps)", 100, 100000, 50);
@@ -1706,7 +1715,7 @@ static obs_properties_t *netint_get_properties(void *data)
     obs_property_list_add_string(rc, "CBR", "CBR");
     obs_property_list_add_string(rc, "VBR", "VBR");
     
-    /* Profile selection: baseline, main, or high */
+    /* H.264 Profile selection: baseline, main, or high */
     obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(prof, "baseline", "baseline");
     obs_property_list_add_string(prof, "main", "main");
@@ -1723,6 +1732,91 @@ static obs_properties_t *netint_get_properties(void *data)
     
     /* Repeat headers checkbox: attach SPS/PPS to every keyframe */
     obs_properties_add_bool(props, "repeat_headers", "Repeat SPS/PPS on Keyframes");
+
+    /* Populate device list if discovery APIs are available */
+    /* This converts the text input to a dropdown with discovered devices */
+    if (p_ni_logan_rsrc_init && p_ni_logan_rsrc_get_local_device_list) {
+        /* Initialize resource management system */
+        /* Accept both SUCCESS (0) and INIT_ALREADY (0x7FFFFFFF) as success */
+        int rsrc_ret = p_ni_logan_rsrc_init(0, 1);
+        if (rsrc_ret == 0 || rsrc_ret == 0x7FFFFFFF) {
+            char names[16][NI_LOGAN_MAX_DEVICE_NAME_LEN] = {0};
+            int n = p_ni_logan_rsrc_get_local_device_list(names, 16);
+            if (n > 0) {
+                /* Get existing device property (text input) */
+                obs_property_t *dev = obs_properties_get(props, "device");
+                if (dev) {
+                    /* Update description if it exists */
+                    obs_property_set_long_description(dev, "Device Name");
+                } else {
+                    /* Create new dropdown if text input doesn't exist (shouldn't happen) */
+                    dev = obs_properties_add_list(props, "device", "Device", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+                }
+                /* Add all discovered devices to dropdown */
+                for (int i = 0; i < n; i++) {
+                    obs_property_list_add_string(dev, names[i], names[i]);
+                }
+            }
+        }
+    }
+    return props;
+}
+
+/**
+ * @brief Create properties UI for H.265 encoder settings
+ * 
+ * This function creates the settings UI for the H.265 encoder with H.265-specific options.
+ * 
+ * Properties Created:
+ * - bitrate: Integer input (100-100000 kbps, step 50)
+ * - keyint: Integer input (1-20 seconds, step 1)
+ * - device: Text input or dropdown (auto-populated if discovery available)
+ * - rc_mode: Dropdown list (CBR or VBR)
+ * - profile: Dropdown list (main, main10) - H.265 profiles
+ * - repeat_headers: Checkbox (attach VPS/SPS/PPS to every keyframe)
+ * 
+ * @param data Encoder context (unused)
+ * @return OBS properties object containing all UI controls
+ */
+static obs_properties_t *netint_h265_get_properties(void *data)
+{
+    UNUSED_PARAMETER(data);
+    obs_properties_t *props = obs_properties_create();
+    
+    /* Bitrate input: 100-100000 kbps, step size 50 kbps */
+    obs_properties_add_int(props, "bitrate", "Bitrate (kbps)", 100, 100000, 50);
+    
+    /* Keyframe interval: 1-20 seconds, step size 1 second */
+    obs_properties_add_int(props, "keyint", "Keyframe Interval (s)", 1, 20, 1);
+    
+    /* Device name: text input (will be converted to dropdown if discovery works) */
+    obs_properties_add_text(props, "device", "Device Name (optional)", OBS_TEXT_DEFAULT);
+    
+    /* Rate control mode: CBR (constant) or VBR (variable) */
+    obs_property_t *rc = obs_properties_add_list(props, "rc_mode", "Rate Control", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(rc, "CBR", "CBR");
+    obs_property_list_add_string(rc, "VBR", "VBR");
+    
+    /* H.265 Profile selection: main (8-bit) or main10 (10-bit) */
+    obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(prof, "Main (8-bit)", "main");
+    obs_property_list_add_string(prof, "Main10 (10-bit)", "main10");
+    obs_property_set_long_description(prof,
+        "H.265 Profiles:\n"
+        "• Main: Standard 8-bit encoding (most compatible)\n"
+        "• Main10: 10-bit encoding (better quality, larger files)");
+    
+    /* GOP preset selection: controls compression vs latency tradeoff */
+    obs_property_t *gop = obs_properties_add_list(props, "gop_preset", "GOP Preset", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(gop, "Default (I-B-B-B-P) - Best Quality", "default");
+    obs_property_list_add_string(gop, "Simple (I-P-P-P) - Lower Latency", "simple");
+    obs_property_set_long_description(gop, 
+        "GOP structure controls compression efficiency:\n"
+        "• Default: Uses B-frames for best quality and compression\n"
+        "• Simple: No B-frames, lower latency but larger file size");
+    
+    /* Repeat headers checkbox: attach VPS/SPS/PPS to every keyframe */
+    obs_properties_add_bool(props, "repeat_headers", "Repeat VPS/SPS/PPS on Keyframes");
 
     /* Populate device list if discovery APIs are available */
     /* This converts the text input to a dropdown with discovered devices */
@@ -1867,8 +1961,8 @@ static struct obs_encoder_info netint_h264_info = {
     .destroy = netint_destroy,
     .update = netint_update,
     .encode = netint_encode,
-    .get_defaults = netint_get_defaults,
-    .get_properties = netint_get_properties,
+    .get_defaults = netint_h264_get_defaults,  /**< H.264-specific defaults */
+    .get_properties = netint_h264_get_properties,  /**< H.264-specific properties */
     .get_extra_data = netint_get_extra_data,
     /* Optional callbacks - explicitly NULL for forward compatibility */
     .get_sei_data = NULL,              /**< SEI data not provided (NULL callback) */
@@ -1887,8 +1981,8 @@ static struct obs_encoder_info netint_h265_info = {
     .destroy = netint_destroy,
     .update = netint_update,
     .encode = netint_encode,
-    .get_defaults = netint_get_defaults,
-    .get_properties = netint_get_properties,
+    .get_defaults = netint_h265_get_defaults,  /**< H.265-specific defaults */
+    .get_properties = netint_h265_get_properties,  /**< H.265-specific properties */
     .get_extra_data = netint_get_extra_data,
     /* Optional callbacks - explicitly NULL for forward compatibility */
     .get_sei_data = NULL,              /**< SEI data not provided (NULL callback) */
