@@ -153,10 +153,10 @@ struct netint_ctx {
         int count;                    /**< Number of frames in buffer */
         int capacity;                 /**< Maximum frames to buffer before processing batch */
     } frame_buffer;
-    bool encoder_busy;               /**< true when encoder is processing a batch */
 
     char *rc_mode;                     /**< Rate control mode: "CBR" or "VBR" */
     char *profile;                      /**< Encoder profile: "baseline", "main", or "high" */
+    char *gop_preset;                  /**< GOP preset: "simple" (I-P-P-P) or "default" (I-B-B-B-P) */
     bool repeat_headers;               /**< If true, attach SPS/PPS to every keyframe */
     int codec_type;                    /**< Codec type: 0 = H.264, 1 = H.265 (HEVC) */
     uint64_t frame_count;              /**< Total frames processed (for start_of_stream logic) */
@@ -296,8 +296,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
 
     /* Initialize frame buffer for batch processing like xcoder_logan */
     ctx->frame_buffer.count = 0;
-    ctx->frame_buffer.capacity = 10;  /* Buffer 10 frames before processing like xcoder_logan */
-    ctx->encoder_busy = false;        /* Encoder starts ready to accept frames */
+    ctx->frame_buffer.capacity = 1;  /* Process frames immediately - OBS reuses frame buffer! */
     
     /* Set basic encoder parameters */
     ctx->enc.dev_enc_idx = 1;  /* H/W ID 1 = encoder (H/W ID 0 = decoder) */
@@ -407,9 +406,10 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->enc.sar_num = 1;
     ctx->enc.sar_den = 1;
     
-    /* Store rate control mode and profile strings (used later for parameter setting) */
+    /* Store rate control mode, profile, and GOP preset strings (used later for parameter setting) */
     ctx->rc_mode = bstrdup(obs_data_get_string(settings, "rc_mode"));
     ctx->profile = bstrdup(obs_data_get_string(settings, "profile"));
+    ctx->gop_preset = bstrdup(obs_data_get_string(settings, "gop_preset"));
     
     /* Repeat headers setting: if true, attach SPS/PPS to every keyframe */
     /* This is useful for streaming where clients may join mid-stream */
@@ -530,7 +530,17 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
          * For now, rely on encoder defaults and focus on getting video output.
          */
 
-        blog(LOG_INFO, "[obs-netint-t4xx] GOP parameters disabled - using encoder defaults");
+        /* Set GOP preset based on user preference */
+        const char *gop_value = "5";  /* Default: GOP 5 (I-B-B-B-P, best quality) */
+        const char *gop_desc = "default (I-B-B-B-P)";
+        
+        if (ctx->gop_preset && strcmp(ctx->gop_preset, "simple") == 0) {
+            gop_value = "2";  /* GOP 2 (I-P-P-P, no B-frames, lower latency) */
+            gop_desc = "simple (I-P-P-P, no B-frames)";
+        }
+        
+        int gop_ret = p_ni_logan_encoder_params_set_value(params, "gopPresetIdx", gop_value, session_ctx);
+        blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s: ret=%d", gop_desc, gop_ret);
 
         /* Set rate control mode: CBR (constant) or VBR (variable) */
         /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
@@ -785,6 +795,7 @@ static void netint_destroy(void *data)
     /* Free configuration strings - allocated by us */
     if (ctx->rc_mode) bfree(ctx->rc_mode);
     if (ctx->profile) bfree(ctx->profile);
+    if (ctx->gop_preset) bfree(ctx->gop_preset);
     
     /* enc is EMBEDDED in ctx, so it will be freed when ctx is freed */
     /* No need to manually free it */
@@ -872,7 +883,7 @@ static void *netint_recv_thread(void *data)
         if (ctx->stop_thread) break;  /* Check after blocking call */
         
         /* Check if we got a valid packet (accounting for metadata size) */
-        int meta_size = 16;  /* Typical metadata overhead */
+        int meta_size = NI_LOGAN_FW_ENC_BITSTREAM_META_DATA_SIZE;
         if (recv_size > meta_size) {
             int packet_size = recv_size - meta_size;
             blog(LOG_INFO, "[obs-netint-t4xx] [RECV THREAD] Got packet: %d bytes (total recv=%d)",
@@ -893,7 +904,8 @@ static void *netint_recv_thread(void *data)
                 continue;
             }
             
-            memcpy(pkt->data, ni_pkt->p_data, (size_t)packet_size);
+            /* Skip metadata - actual H.264/H.265 data starts after meta_size bytes */
+            memcpy(pkt->data, (uint8_t*)ni_pkt->p_data + meta_size, (size_t)packet_size);
             pkt->size = (size_t)packet_size;
             
             /* Extract headers from first packet if not already done */
@@ -909,6 +921,9 @@ static void *netint_recv_thread(void *data)
             /* NOTE: With device_session API, timestamps come from packet metadata */
             pkt->pts = ni_pkt->pts;
             pkt->dts = ni_pkt->dts;
+            
+            blog(LOG_INFO, "[obs-netint-t4xx] [RECV THREAD] Packet timestamps: PTS=%lld, DTS=%lld", 
+                 (long long)pkt->pts, (long long)pkt->dts);
             
             /* If timestamps not set, use fallback from encoder context */
             if (pkt->pts == 0 && ctx->enc.latest_dts != 0) {
@@ -1169,8 +1184,7 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
     /* Clear the frame buffer now that frames are in hardware FIFO */
     ctx->frame_buffer.count = 0;
 
-    /* Encoder will signal readiness once packets start coming back */
-    blog(LOG_INFO, "[obs-netint-t4xx] Batch submitted, waiting for encoder to produce packets");
+    blog(LOG_INFO, "[obs-netint-t4xx] Batch submitted, encoder ready for next frame");
 
     return true;
 }
@@ -1434,9 +1448,7 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
             packet->priority = obs_parse_avc_packet_priority(packet);
         }
 
-        /* Encoder is no longer busy since it's producing output */
-        ctx->encoder_busy = false;
-        blog(LOG_INFO, "[obs-netint-t4xx] Encoder no longer busy - ready for next batch");
+        /* Encoder busy flag already cleared by netint_encode_batch */
 
         /* Free packet struct (but NOT data - OBS owns it now!) */
         bfree(pkt);
@@ -1453,13 +1465,7 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
     /* Buffer the incoming frame */
     if (frame) {
-        /* If encoder is busy processing previous batch, don't buffer more frames */
-        if (ctx->encoder_busy) {
-            blog(LOG_DEBUG, "[obs-netint-t4xx] Encoder busy processing previous batch, waiting...");
-            *received = false;
-            return true;
-        }
-
+        /* Buffer frame (with capacity=1, this immediately triggers batch processing) */
         if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
             /* Add frame to buffer */
             ctx->frame_buffer.frames[ctx->frame_buffer.count] = (void *)frame;
@@ -1475,7 +1481,6 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
         /* Buffer is full - process the batch */
         blog(LOG_INFO, "[obs-netint-t4xx] Frame buffer full (%d frames), processing batch like xcoder_logan", ctx->frame_buffer.count);
-        ctx->encoder_busy = true;  /* Mark encoder as busy */
         return netint_encode_batch(ctx, packet, received);
     } else {
         /* Flushing mode */
@@ -1500,6 +1505,9 @@ static void netint_get_defaults(obs_data_t *settings)
     
     /* Default profile: high (best quality, supports all encoder features) */
     obs_data_set_default_string(settings, "profile", "high");
+    
+    /* Default GOP preset: default (I-B-B-B-P pattern with B-frames for best quality) */
+    obs_data_set_default_string(settings, "gop_preset", "default");
     
     /* Default repeat headers: true (attach SPS/PPS to every keyframe) */
     /* This is important for streaming where clients may join mid-stream */
@@ -1559,6 +1567,15 @@ static obs_properties_t *netint_get_properties(void *data)
     obs_property_list_add_string(prof, "baseline", "baseline");
     obs_property_list_add_string(prof, "main", "main");
     obs_property_list_add_string(prof, "high", "high");
+    
+    /* GOP preset selection: controls compression vs latency tradeoff */
+    obs_property_t *gop = obs_properties_add_list(props, "gop_preset", "GOP Preset", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(gop, "Default (I-B-B-B-P) - Best Quality", "default");
+    obs_property_list_add_string(gop, "Simple (I-P-P-P) - Lower Latency", "simple");
+    obs_property_set_long_description(gop, 
+        "GOP structure controls compression efficiency:\n"
+        "• Default: Uses B-frames for best quality and compression\n"
+        "• Simple: No B-frames, lower latency but larger file size");
     
     /* Repeat headers checkbox: attach SPS/PPS to every keyframe */
     obs_properties_add_bool(props, "repeat_headers", "Repeat SPS/PPS on Keyframes");

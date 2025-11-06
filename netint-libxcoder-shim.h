@@ -46,6 +46,9 @@
 /** Maximum transmit/receive buffer size for packets */
 #define NI_LOGAN_MAX_TX_SZ (8 * 1024 * 1024)  /* 8 MB */
 
+/** Encoder bitstream packet metadata size (from ni_defs_logan.h) */
+#define NI_LOGAN_FW_ENC_BITSTREAM_META_DATA_SIZE 40
+
 /** Return codes */
 #define NI_LOGAN_RETCODE_SUCCESS 0
 #define NI_LOGAN_RETCODE_FAILURE -1
