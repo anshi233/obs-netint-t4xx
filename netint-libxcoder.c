@@ -127,7 +127,7 @@ int (*p_ni_logan_encode_copy_packet_data)(ni_logan_enc_context_t *, uint8_t *, i
 int (*p_ni_logan_encode_receive)(ni_logan_enc_context_t *) = NULL;
 
 /** Allocate encoder frame buffer (for device session API) */
-int (*p_ni_logan_encoder_frame_buffer_alloc)(ni_logan_frame_t *, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int, int) = NULL;
+int (*p_ni_logan_encoder_frame_buffer_alloc)(ni_logan_frame_t *, int, int, int[NI_LOGAN_MAX_NUM_DATA_POINTERS], int, int, int) = NULL;
 
 /** Free frame buffer */
 int (*p_ni_logan_frame_buffer_free)(ni_logan_frame_t *) = NULL;

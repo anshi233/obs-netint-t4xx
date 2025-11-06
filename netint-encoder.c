@@ -840,6 +840,23 @@ static bool netint_update(void *data, obs_data_t *settings)
 }
 
 /**
+ * @brief Specify preferred video format for encoder input
+ * 
+ * This function tells OBS what pixel format we want frames in.
+ * NETINT encoder requires I420 (planar YUV420) format, not NV12.
+ * 
+ * @param data Encoder context (unused)
+ * @param info Video scale info - we set info->format to our preferred format
+ */
+static void netint_get_video_info(void *data, struct video_scale_info *info)
+{
+    UNUSED_PARAMETER(data);
+    /* NETINT encoder requires I420 format (planar Y, U, V separate) */
+    /* NOT NV12 (which has interleaved UV plane) */
+    info->format = VIDEO_FORMAT_I420;
+}
+
+/**
  * @brief Background thread that continuously receives packets from encoder
  * 
  * CRITICAL: This thread is NECESSARY because ni_logan_encode_receive() BLOCKS
@@ -1022,7 +1039,7 @@ static bool netint_send_eos_frame(struct netint_ctx *ctx)
                                   eos_linesize, eos_dst_height);
 
     int eos_alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(eos_ni_frame, ctx->enc.width, ctx->enc.height,
-                                                               eos_linesize, (ctx->codec_type == 0) ? 1 : 0, 0);
+                                                               eos_linesize, (ctx->codec_type == 0) ? 1 : 0, 0, 1);
     if (eos_alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
         blog(LOG_ERROR, "[obs-netint-t4xx] EOS frame buffer allocation failed (ret=%d)", eos_alloc_ret);
         return false;
@@ -1075,12 +1092,23 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
     for (int i = 0; i < ctx->frame_buffer.count; i++) {
         struct encoder_frame *frame = (struct encoder_frame *)ctx->frame_buffer.frames[i];
 
-        blog(LOG_INFO, "[obs-netint-t4xx] Sending frame %d/%d: %dx%d @ %lld",
-             i+1, ctx->frame_buffer.count, ctx->enc.width, ctx->enc.height, (long long)frame->pts);
-
         /* Get basic frame dimensions */
         int width = ctx->enc.width;
         int height = ctx->enc.height;
+
+        blog(LOG_INFO, "[obs-netint-t4xx] Sending frame %d/%d: %dx%d @ %lld",
+             i+1, ctx->frame_buffer.count, width, height, (long long)frame->pts);
+        
+        blog(LOG_INFO, "[obs-netint-t4xx] OBS frame: linesize=[%d,%d,%d] data=[%p,%p,%p]",
+             frame->linesize[0], frame->linesize[1], frame->linesize[2],
+             frame->data[0], frame->data[1], frame->data[2]);
+        
+        /* Check if U and V planes look correct */
+        if (frame->data[1] && frame->data[2]) {
+            ptrdiff_t uv_offset = frame->data[2] - frame->data[1];
+            blog(LOG_INFO, "[obs-netint-t4xx] U-V plane offset: %td bytes (expected: %d for normal I420)",
+                 uv_offset, frame->linesize[1] * height / 2);
+        }
 
         /* Allocate our own session_data_io_t on stack (like xcoder) */
         ni_logan_session_data_io_t input_data = {0};
@@ -1096,7 +1124,7 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
 
         int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
                                                                dst_stride, (ctx->codec_type == 0) ? 1 : 0, 
-                                                               ni_frame->extra_data_len);
+                                                               ni_frame->extra_data_len, 1);
         if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
             blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame data buffers (ret=%d)", alloc_ret);
             return false;
@@ -1122,17 +1150,40 @@ static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *p
             return false;
         }
 
+        /* OBS will provide I420 format (via get_video_info callback) */
+        /* I420 = planar Y, U, V with separate planes */
         uint8_t *src_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
-            frame->data[0], frame->data[1], frame->data[2], NULL
+            frame->data[0],      /* Y plane */
+            frame->data[1],      /* U plane */
+            frame->data[2],      /* V plane */
+            NULL
         };
         int src_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
-            frame->linesize[0], frame->linesize[1], frame->linesize[2], 0
+            frame->linesize[0],  /* Y stride */
+            frame->linesize[1],  /* U stride */
+            frame->linesize[2],  /* V stride */
+            0
+        };
+        int src_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
+            height,       /* Y plane height */
+            height / 2,   /* U plane height (YUV420 - subsampled by 2) */
+            height / 2,   /* V plane height (YUV420 - subsampled by 2) */
+            0
         };
 
+        /* Log YUV copy parameters for debugging */
+        blog(LOG_INFO, "[obs-netint-t4xx] YUV copy: src_stride=[%d,%d,%d] src_height=[%d,%d,%d] dst_stride=[%d,%d,%d] dst_height=[%d,%d,%d]",
+             src_stride[0], src_stride[1], src_stride[2],
+             src_height[0], src_height[1], src_height[2],
+             dst_stride[0], dst_stride[1], dst_stride[2],
+             dst_height[0], dst_height[1], dst_height[2]);
+
         /* Copy YUV data using hardware-optimized function */
+        /* API: ni_logan_copy_hw_yuv420p(dst, src, width, height, bit_depth_factor, 
+                                          dst_stride, dst_height, src_stride, src_height) */
         p_ni_logan_copy_hw_yuv420p((uint8_t **)ni_frame->p_data, (uint8_t **)src_planes,
                                     width, height, 1,
-                                    dst_stride, dst_height, src_stride, src_stride);
+                                    dst_stride, dst_height, src_stride, src_height);
 
         /* Send frame using LOW-LEVEL device_session_write (like xcoder) - NO FIFO! */
         int sent = p_ni_logan_device_session_write(ctx->enc.p_session_ctx, &input_data,
@@ -1215,7 +1266,7 @@ static bool netint_encode_flush(struct netint_ctx *ctx, struct encoder_packet *p
                                   eos_linesize, eos_dst_height);
 
     int eos_alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(eos_ni_frame, ctx->enc.width, ctx->enc.height,
-                                                               eos_linesize, (ctx->codec_type == 0) ? 1 : 0, 0);
+                                                               eos_linesize, (ctx->codec_type == 0) ? 1 : 0, 0, 1);
     if (eos_alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
         blog(LOG_ERROR, "[obs-netint-t4xx] EOS frame buffer allocation failed (ret=%d)", eos_alloc_ret);
         return false;
@@ -1729,7 +1780,7 @@ static struct obs_encoder_info netint_h264_info = {
     /* Optional callbacks - explicitly NULL for forward compatibility */
     .get_sei_data = NULL,              /**< SEI data not provided (NULL callback) */
     .get_audio_info = NULL,            /**< Audio info not applicable (video encoder only) */
-    .get_video_info = NULL,            /**< Video info not provided (NULL callback) */
+    .get_video_info = netint_get_video_info,  /**< Request I420 format from OBS */
 };
 
 /** H.265 (HEVC) encoder registration - appears as "NETINT T4XX" in encoder list */
@@ -1749,7 +1800,7 @@ static struct obs_encoder_info netint_h265_info = {
     /* Optional callbacks - explicitly NULL for forward compatibility */
     .get_sei_data = NULL,              /**< SEI data not provided (NULL callback) */
     .get_audio_info = NULL,            /**< Audio info not applicable (video encoder only) */
-    .get_video_info = NULL,            /**< Video info not provided (NULL callback) */
+    .get_video_info = netint_get_video_info,  /**< Request I420 format from OBS */
 };
 /*@}*/
 
