@@ -172,6 +172,18 @@ struct netint_ctx {
     /* Debug flags */
     bool debug_eos_sent;              /**< true if debug EOS was already sent */
 
+    /* Debug counters for frame pacing / bitrate issues */
+    uint64_t debug_queue_count;
+    uint64_t debug_send_count;
+    uint64_t debug_recv_count;
+    int64_t debug_last_queue_pts;
+    int64_t debug_last_send_pts;
+    int64_t debug_last_recv_pts;
+    uint64_t debug_encode_calls;
+    uint64_t debug_encode_frame_calls;
+    uint64_t debug_encode_null_calls;
+    uint64_t debug_packets_delivered;
+
     /* Precomputed hardware frame layout */
     int hw_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS];
     int hw_height[NI_LOGAN_MAX_NUM_DATA_POINTERS];
@@ -240,6 +252,9 @@ static bool netint_queue_eos(struct netint_ctx *ctx);
 static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job);
 static bool netint_hw_receive_once(struct netint_ctx *ctx);
 static void netint_hw_drain(struct netint_ctx *ctx, bool drain_all);
+static bool netint_set_encoder_param(struct netint_ctx *ctx, ni_logan_encoder_params_t *params,
+                                     ni_logan_session_context_t *session_ctx,
+                                     const char *name, const char *value);
 
 /**
  * @brief Simple error logging helper
@@ -263,6 +278,33 @@ static void netint_log_error(struct netint_ctx *ctx, const char *operation, int 
         blog(LOG_ERROR, "[obs-netint-t4xx] Too many consecutive errors (%d), encoder may need recreation",
               ctx->consecutive_errors);
     }
+}
+
+static bool netint_set_encoder_param(struct netint_ctx *ctx, ni_logan_encoder_params_t *params,
+                                     ni_logan_session_context_t *session_ctx,
+                                     const char *name, const char *value)
+{
+    if (!params || !session_ctx) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Tried to set encoder param %s=%s but encoder params/session_ctx are NULL",
+             name ? name : "(null)", value ? value : "(null)");
+        return false;
+    }
+
+    if (!p_ni_logan_encoder_params_set_value) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encoder_params_set_value symbol missing while setting %s=%s",
+             name ? name : "(null)", value ? value : "(null)");
+        return false;
+    }
+
+    int ret = p_ni_logan_encoder_params_set_value(params, name, value, session_ctx);
+    if (ret != NI_LOGAN_RETCODE_SUCCESS) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set encoder param %s=%s (ret=%d)",
+             name ? name : "(null)", value ? value : "(null)", ret);
+        return false;
+    }
+
+    blog(LOG_INFO, "[obs-netint-t4xx] Encoder param %s=%s applied successfully", name, value);
+    return true;
 }
 
 /**
@@ -419,6 +461,11 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->enc.timebase_num = (int)voi->fps_den;
     ctx->enc.timebase_den = (int)voi->fps_num;
     ctx->enc.ticks_per_frame = 1;
+    ctx->enc.fps_number = (int)voi->fps_num;
+    ctx->enc.fps_denominator = (int)voi->fps_den;
+    blog(LOG_INFO, "[obs-netint-t4xx] Encoder timebase=%d/%d fps=%d/%d",
+         ctx->enc.timebase_num, ctx->enc.timebase_den,
+         ctx->enc.fps_number, ctx->enc.fps_denominator);
     
     /* Codec selection: Determined by which encoder registration OBS used */
     /* OBS will call the appropriate create function based on encoder ID */
@@ -622,34 +669,55 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
             gop_desc = "simple (I-P-P-P, no B-frames)";
         }
         
-        int gop_ret = p_ni_logan_encoder_params_set_value(params, "gopPresetIdx", gop_value, session_ctx);
-        blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s: ret=%d", gop_desc, gop_ret);
+        if (!netint_set_encoder_param(ctx, params, session_ctx, "gopPresetIdx", gop_value)) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set GOP preset to %s", gop_desc);
+            goto fail;
+        }
+        blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s", gop_desc);
 
         const bool rc_disabled = (ctx->rc_mode && strcmp(ctx->rc_mode, "DISABLED") == 0);
 
         if (rc_disabled) {
-            p_ni_logan_encoder_params_set_value(params, "RcEnable", "0", session_ctx);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "RcEnable", "0")) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to disable rate control");
+                goto fail;
+            }
             blog(LOG_INFO, "[obs-netint-t4xx] Rate control DISABLED (RcEnable=0)");
 
             char qp_str[16];
             snprintf(qp_str, sizeof(qp_str), "%d", ctx->qp_value);
-            p_ni_logan_encoder_params_set_value(params, "intraQP", qp_str, session_ctx);
-            p_ni_logan_encoder_params_set_value(params, "minQp", qp_str, session_ctx);
-            p_ni_logan_encoder_params_set_value(params, "maxQp", qp_str, session_ctx);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "intraQP", qp_str) ||
+                !netint_set_encoder_param(ctx, params, session_ctx, "minQp", qp_str) ||
+                !netint_set_encoder_param(ctx, params, session_ctx, "maxQp", qp_str)) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set constant QP parameters");
+                goto fail;
+            }
             blog(LOG_INFO, "[obs-netint-t4xx] Constant QP mode: intraQP/minQp/maxQp set to %d", ctx->qp_value);
 
             /* Ensure RC-specific flags are cleared */
-            p_ni_logan_encoder_params_set_value(params, "cbr", "0", session_ctx);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "cbr", "0")) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to clear CBR flag while RC disabled");
+                goto fail;
+            }
 
             if (ctx->codec_type == 1 && ctx->lossless) {
-                p_ni_logan_encoder_params_set_value(params, "losslessEnable", "1", session_ctx);
+                if (!netint_set_encoder_param(ctx, params, session_ctx, "losslessEnable", "1")) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to enable lossless mode");
+                    goto fail;
+                }
                 blog(LOG_INFO, "[obs-netint-t4xx] Lossless HEVC encoding enabled");
             } else {
-                p_ni_logan_encoder_params_set_value(params, "losslessEnable", "0", session_ctx);
+                if (!netint_set_encoder_param(ctx, params, session_ctx, "losslessEnable", "0")) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to disable lossless flag");
+                    goto fail;
+                }
             }
         } else {
             /* CRITICAL: Enable rate control first! Without this, encoder uses Constant QP mode and ignores bitrate! */
-            p_ni_logan_encoder_params_set_value(params, "RcEnable", "1", session_ctx);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "RcEnable", "1")) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to enable rate control");
+                goto fail;
+            }
             blog(LOG_INFO, "[obs-netint-t4xx] Rate control ENABLED (RcEnable=1)");
 
             /* Set bitrate and framerate parameters */
@@ -661,31 +729,51 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
             sprintf(framerate_str, "%d", ctx->enc.timebase_den);
             sprintf(framerate_denom_str, "%d", ctx->enc.timebase_num);
 
-            p_ni_logan_encoder_params_set_value(params, "bitrate", bitrate_str, session_ctx);
-            blog(LOG_INFO, "[obs-netint-t4xx] Bitrate parameter set to %lld bps (%d kbps): ret=0",
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "bitrate", bitrate_str)) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to apply target bitrate %lld bps",
+                     (long long)ctx->enc.bit_rate);
+                goto fail;
+            }
+            blog(LOG_INFO, "[obs-netint-t4xx] Bitrate parameter set to %lld bps (%d kbps)",
                  (long long)ctx->enc.bit_rate, (int)(ctx->enc.bit_rate / 1000));
             
-            p_ni_logan_encoder_params_set_value(params, "frameRate", framerate_str, session_ctx);
-            p_ni_logan_encoder_params_set_value(params, "frameRateDenom", framerate_denom_str, session_ctx);
-            blog(LOG_INFO, "[obs-netint-t4xx] Framerate parameters: %d/%d (%.2f fps), ret=0,0",
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "frameRate", framerate_str) ||
+                !netint_set_encoder_param(ctx, params, session_ctx, "frameRateDenom", framerate_denom_str)) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set encoder framerate parameters (%s/%s)",
+                     framerate_str, framerate_denom_str);
+                goto fail;
+            }
+            blog(LOG_INFO, "[obs-netint-t4xx] Framerate parameters: %d/%d (%.2f fps)",
                  ctx->enc.timebase_den, ctx->enc.timebase_num,
                  ctx->enc.timebase_den / (double)ctx->enc.timebase_num);
             
-            p_ni_logan_encoder_params_set_value(params, "RcInitDelay", "3000", session_ctx);
-            blog(LOG_INFO, "[obs-netint-t4xx] VBV buffer size (RCInitDelay) set to 3000 ms: ret=0");
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "RcInitDelay", "3000")) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set VBV buffer size (RcInitDelay)");
+                goto fail;
+            }
+            blog(LOG_INFO, "[obs-netint-t4xx] VBV buffer size (RCInitDelay) set to 3000 ms");
 
             /* Set rate control mode: CBR (constant) or VBR (variable) */
             /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
             if (ctx->rc_mode && strcmp(ctx->rc_mode, "CBR") == 0) {
-                p_ni_logan_encoder_params_set_value(params, "cbr", "1", session_ctx);
+                if (!netint_set_encoder_param(ctx, params, session_ctx, "cbr", "1")) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to enable CBR mode");
+                    goto fail;
+                }
                 blog(LOG_INFO, "[obs-netint-t4xx] Rate control mode: CBR (constant bitrate)");
             } else {
-                p_ni_logan_encoder_params_set_value(params, "cbr", "0", session_ctx);
+                if (!netint_set_encoder_param(ctx, params, session_ctx, "cbr", "0")) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to enable VBR mode");
+                    goto fail;
+                }
                 blog(LOG_INFO, "[obs-netint-t4xx] Rate control mode: VBR (variable bitrate)");
             }
 
             /* Lossless is incompatible with rate control */
-            p_ni_logan_encoder_params_set_value(params, "losslessEnable", "0", session_ctx);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "losslessEnable", "0")) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to ensure lossless disabled while RC enabled");
+                goto fail;
+            }
         }
         
         /* Set encoder profile - maps string names to codec-specific profile IDs */
@@ -724,7 +812,10 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
                 }
             }
             if (profile_id_str) {
-                p_ni_logan_encoder_params_set_value(params, "profile", profile_id_str, session_ctx);
+                if (!netint_set_encoder_param(ctx, params, session_ctx, "profile", profile_id_str)) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set encoder profile to %s", ctx->profile);
+                    goto fail;
+                }
                 blog(LOG_INFO, "[obs-netint-t4xx] Profile set to: %s (ID=%s)", ctx->profile, profile_id_str);
             }
         }
@@ -922,6 +1013,20 @@ static void netint_destroy(void *data)
         blog(LOG_WARNING, "[obs-netint-t4xx] ⚠️  ABRUPT SHUTDOWN: No EOS handshake performed");
         blog(LOG_WARNING, "[obs-netint-t4xx] OBS skipped flush - we'll send EOS frame now in destroy");
     }
+
+    blog(LOG_INFO,
+         "[obs-netint-t4xx][debug] Frame counters: queued=%llu sent=%llu received=%llu frames_submitted=%llu frame_count=%llu",
+         (unsigned long long)ctx->debug_queue_count,
+         (unsigned long long)ctx->debug_send_count,
+         (unsigned long long)ctx->debug_recv_count,
+         (unsigned long long)ctx->frames_submitted,
+         (unsigned long long)ctx->frame_count);
+    blog(LOG_INFO,
+         "[obs-netint-t4xx][debug] Encode counters: total_calls=%llu frame_calls=%llu null_calls=%llu packets_delivered=%llu",
+         (unsigned long long)ctx->debug_encode_calls,
+         (unsigned long long)ctx->debug_encode_frame_calls,
+         (unsigned long long)ctx->debug_encode_null_calls,
+         (unsigned long long)ctx->debug_packets_delivered);
     
 #ifdef DEBUG_NETINT_PLUGIN
     /* Validate magic before destroy */
@@ -1219,6 +1324,22 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
                                    src_height);
     }
 
+    int64_t pts_delta = (ctx->debug_queue_count == 0) ? 0 : (job->pts - ctx->debug_last_queue_pts);
+    ctx->debug_last_queue_pts = job->pts;
+    ctx->debug_queue_count++;
+    if (ctx->debug_queue_count <= 10 || ctx->debug_queue_count % 60 == 0) {
+        double pts_ms = (ctx->enc.timebase_den > 0)
+                             ? (job->pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                             : 0.0;
+        double delta_ms = (ctx->enc.timebase_den > 0)
+                               ? (pts_delta * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                               : 0.0;
+        blog(LOG_INFO,
+             "[obs-netint-t4xx][debug] Queue frame #%llu pts=%lld (%.3f ms) delta=%lld (%.3f ms) linesize0=%d",
+             (unsigned long long)ctx->debug_queue_count, (long long)job->pts, pts_ms,
+             (long long)pts_delta, delta_ms, frame->linesize[0]);
+    }
+
     netint_enqueue_job(ctx, job, true);
     return true;
 }
@@ -1333,6 +1454,29 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
 
     if (!job->end_of_stream) {
         ctx->frame_count++;
+
+        int64_t pts_delta = (ctx->debug_send_count == 0) ? 0 : (job->pts - ctx->debug_last_send_pts);
+        ctx->debug_last_send_pts = job->pts;
+        ctx->debug_send_count++;
+
+        if (ctx->debug_send_count <= 10 || ctx->debug_send_count % 60 == 0) {
+            double pts_ms = (ctx->enc.timebase_den > 0)
+                                ? (job->pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                                : 0.0;
+            double delta_ms = (ctx->enc.timebase_den > 0)
+                                  ? (pts_delta * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                                  : 0.0;
+
+            pthread_mutex_lock(&ctx->frame_queue_mutex);
+            int pending = ctx->pending_jobs;
+            int inflight = ctx->inflight_frames;
+            pthread_mutex_unlock(&ctx->frame_queue_mutex);
+
+            blog(LOG_INFO,
+                 "[obs-netint-t4xx][debug] Send frame #%llu pts=%lld (%.3f ms) delta=%lld (%.3f ms) inflight(before)=%d pending=%d",
+                 (unsigned long long)ctx->debug_send_count, (long long)job->pts, pts_ms,
+                 (long long)pts_delta, delta_ms, inflight, pending);
+        }
     }
 
     ctx->consecutive_errors = 0;
@@ -1402,6 +1546,24 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
                     pkt_keyframe = obs_hevc_keyframe(copied_data, copied_size);
                 } else {
                     pkt_keyframe = obs_avc_keyframe(copied_data, copied_size);
+                }
+
+                int64_t pts_delta = (ctx->debug_recv_count == 0) ? 0 : (pkt_pts - ctx->debug_last_recv_pts);
+                ctx->debug_last_recv_pts = pkt_pts;
+                ctx->debug_recv_count++;
+
+                if (ctx->debug_recv_count <= 10 || ctx->debug_recv_count % 60 == 0) {
+                    double pts_ms = (ctx->enc.timebase_den > 0)
+                                        ? (pkt_pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                                        : 0.0;
+                    double delta_ms = (ctx->enc.timebase_den > 0)
+                                          ? (pts_delta * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                                          : 0.0;
+                    blog(LOG_INFO,
+                         "[obs-netint-t4xx][debug] Receive pkt #%llu size=%zu pts=%lld (%.3f ms) delta=%lld (%.3f ms) key=%d",
+                         (unsigned long long)ctx->debug_recv_count, copied_size,
+                         (long long)pkt_pts, pts_ms, (long long)pts_delta, delta_ms,
+                         pkt_keyframe ? 1 : 0);
                 }
 
                 ctx->enc.encoder_eof = ni_pkt->end_of_stream;
@@ -1533,6 +1695,27 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
     NETINT_VALIDATE_ENC_CONTEXT(ctx, "netint_encode entry");
 
+    ctx->debug_encode_calls++;
+    if (frame) {
+        ctx->debug_encode_frame_calls++;
+        if (ctx->debug_encode_frame_calls <= 10 || ctx->debug_encode_frame_calls % 60 == 0) {
+            double pts_ms = (ctx->enc.timebase_den > 0)
+                                ? (frame->pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
+                                : 0.0;
+            blog(LOG_INFO,
+                 "[obs-netint-t4xx][debug] encode() call #%llu with frame pts=%lld (%.3f ms)",
+                 (unsigned long long)ctx->debug_encode_calls,
+                 (long long)frame->pts, pts_ms);
+        }
+    } else {
+        ctx->debug_encode_null_calls++;
+        if (ctx->debug_encode_null_calls <= 5 || ctx->debug_encode_null_calls % 60 == 0) {
+            blog(LOG_INFO,
+                 "[obs-netint-t4xx][debug] encode() call #%llu with NULL frame (flush=%d)",
+                 (unsigned long long)ctx->debug_encode_calls, ctx->flushing ? 1 : 0);
+        }
+    }
+
     /* Check for packets produced by IO thread */
     pthread_mutex_lock(&ctx->queue_mutex);
     struct netint_pkt *pkt = ctx->pkt_queue_head;
@@ -1544,6 +1727,7 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     }
     pthread_mutex_unlock(&ctx->queue_mutex);
 
+    bool delivered_packet = false;
     if (pkt) {
         packet->data = pkt->data;
         packet->size = pkt->size;
@@ -1564,8 +1748,9 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
         }
 
         bfree(pkt);
+        ctx->debug_packets_delivered++;
         *received = true;
-        return true;
+        delivered_packet = true;
     }
 
     if (!frame) {
@@ -1577,7 +1762,6 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
             ctx->flushing = true;
         }
 
-        *received = false;
         return true;
     }
 
@@ -1585,7 +1769,9 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
         return false;
     }
 
-    *received = false;
+    if (!delivered_packet) {
+        *received = false;
+    }
     return true;
 }
 /**
