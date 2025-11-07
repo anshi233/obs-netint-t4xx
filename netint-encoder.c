@@ -737,6 +737,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->pkt_queue_tail = NULL;
     ctx->stop_thread = false;
     ctx->thread_created = false;
+    ctx->flushing = false;
     
     /* Start background receive thread */
     if (pthread_create(&ctx->recv_thread, NULL, netint_recv_thread, ctx) != 0) {
@@ -1156,23 +1157,24 @@ static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *fram
 
     ni_logan_frame_t *ni_frame = &input_fme->data.frame;
 
+    int dst_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
+    int dst_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
+    p_ni_logan_get_hw_yuv420p_dim(width, height, bit_depth_factor, is_h264,
+                                  dst_stride, dst_height);
+
+    ni_frame->extra_data_len = 64;
+
+    int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
+                                                           dst_stride, is_h264,
+                                                           ni_frame->extra_data_len,
+                                                           bit_depth_factor);
+    if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame buffer (ret=%d)", alloc_ret);
+        goto done;
+    }
+    allocated_buffer = true;
+
     if (!end_of_stream && frame) {
-        int dst_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
-        int dst_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
-        p_ni_logan_get_hw_yuv420p_dim(width, height, bit_depth_factor, is_h264,
-                                      dst_stride, dst_height);
-
-        ni_frame->extra_data_len = 64;
-        int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
-                                                               dst_stride, is_h264,
-                                                               ni_frame->extra_data_len,
-                                                               bit_depth_factor);
-        if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame buffer (ret=%d)", alloc_ret);
-            goto done;
-        }
-        allocated_buffer = true;
-
         uint8_t *src_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
             frame->data[0],
             frame->data[1],
@@ -1192,8 +1194,13 @@ static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *fram
         p_ni_logan_copy_hw_yuv420p((uint8_t **)ni_frame->p_data, (uint8_t **)src_planes,
                                     width, height, bit_depth_factor,
                                     dst_stride, dst_height, src_stride, src_height);
-    } else {
-        ni_frame->extra_data_len = 0;
+    } else if (allocated_buffer) {
+        for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+            if (ni_frame->p_data[i] && dst_stride[i] > 0 && dst_height[i] > 0) {
+                size_t plane_size = (size_t)dst_stride[i] * (size_t)dst_height[i];
+                memset(ni_frame->p_data[i], 0, plane_size);
+            }
+        }
     }
 
     ni_frame->video_width = width;
@@ -1364,30 +1371,33 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
      * ===================================================================
      */
 
-    /* Buffer the incoming frame */
-    if (frame) {
-        /* Buffer frame (with capacity=1, this immediately triggers batch processing) */
-        if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
-            /* Add frame to buffer */
-            ctx->frame_buffer.frames[ctx->frame_buffer.count] = (void *)frame;
-            ctx->frame_buffer.count++;
-            blog(LOG_INFO, "[obs-netint-t4xx] Buffered frame %d/%d", ctx->frame_buffer.count, ctx->frame_buffer.capacity);
-
-            /* If buffer not full yet, tell OBS we don't have a packet ready */
-            if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
-                *received = false;
-                return true;
-            }
+    if (!frame) {
+        if (!ctx->flushing) {
+            blog(LOG_INFO, "[obs-netint-t4xx] Flushing encoder - no more frames");
+            return netint_encode_flush(ctx, packet, received);
         }
 
-        /* Buffer is full - process the batch */
-        blog(LOG_INFO, "[obs-netint-t4xx] Frame buffer full (%d frames), processing batch like xcoder_logan", ctx->frame_buffer.count);
-        return netint_encode_batch(ctx, packet, received);
-    } else {
-        /* Flushing mode */
-        blog(LOG_INFO, "[obs-netint-t4xx] Flushing encoder - no more frames");
-        return netint_encode_flush(ctx, packet, received);
+        *received = false;
+        return true;
     }
+
+    /* Buffer the incoming frame */
+    if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
+        /* Add frame to buffer */
+        ctx->frame_buffer.frames[ctx->frame_buffer.count] = (void *)frame;
+        ctx->frame_buffer.count++;
+        blog(LOG_INFO, "[obs-netint-t4xx] Buffered frame %d/%d", ctx->frame_buffer.count, ctx->frame_buffer.capacity);
+
+        /* If buffer not full yet, tell OBS we don't have a packet ready */
+        if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
+            *received = false;
+            return true;
+        }
+    }
+
+    /* Buffer is full - process the batch */
+    blog(LOG_INFO, "[obs-netint-t4xx] Frame buffer full (%d frames), processing batch like xcoder_logan", ctx->frame_buffer.count);
+    return netint_encode_batch(ctx, packet, received);
 }
 /**
  * @brief Set default settings for H.264 encoder
