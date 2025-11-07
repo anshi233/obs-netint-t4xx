@@ -169,21 +169,6 @@ struct netint_ctx {
     int max_inflight;                 /**< Maximum frames to keep in-flight before draining */
     uint64_t frames_submitted;        /**< Total frames enqueued (for start-of-stream decisions) */
 
-    /* Debug flags */
-    bool debug_eos_sent;              /**< true if debug EOS was already sent */
-
-    /* Debug counters for frame pacing / bitrate issues */
-    uint64_t debug_queue_count;
-    uint64_t debug_send_count;
-    uint64_t debug_recv_count;
-    int64_t debug_last_queue_pts;
-    int64_t debug_last_send_pts;
-    int64_t debug_last_recv_pts;
-    uint64_t debug_encode_calls;
-    uint64_t debug_encode_frame_calls;
-    uint64_t debug_encode_null_calls;
-    uint64_t debug_packets_delivered;
-
     /* Precomputed hardware frame layout */
     int hw_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS];
     int hw_height[NI_LOGAN_MAX_NUM_DATA_POINTERS];
@@ -303,7 +288,7 @@ static bool netint_set_encoder_param(struct netint_ctx *ctx, ni_logan_encoder_pa
         return false;
     }
 
-    blog(LOG_INFO, "[obs-netint-t4xx] Encoder param %s=%s applied successfully", name, value);
+    blog(LOG_DEBUG, "[obs-netint-t4xx] Encoder param %s=%s applied successfully", name, value);
     return true;
 }
 
@@ -585,14 +570,16 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     blog(LOG_INFO, "[obs-netint-t4xx]   p_encoder_params = %p (should NOT be NULL)", ctx->enc.p_encoder_params);
     blog(LOG_INFO, "[obs-netint-t4xx]   input_data_fifo = %p (should NOT be NULL)", ctx->enc.input_data_fifo);
     
+#ifdef DEBUG_NETINT_PLUGIN
     /* DEBUG: Show struct memory layout */
-    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
-    blog(LOG_INFO, "[obs-netint-t4xx] STRUCT LAYOUT DEBUG:");
-    blog(LOG_INFO, "[obs-netint-t4xx]   &ctx->enc = %p (base address)", &ctx->enc);
-    blog(LOG_INFO, "[obs-netint-t4xx]   &ctx->enc.input_data_fifo = %p (field offset = %zu bytes)", 
+    blog(LOG_DEBUG, "[obs-netint-t4xx] ========================================");
+    blog(LOG_DEBUG, "[obs-netint-t4xx] STRUCT LAYOUT DEBUG:");
+    blog(LOG_DEBUG, "[obs-netint-t4xx]   &ctx->enc = %p (base address)", &ctx->enc);
+    blog(LOG_DEBUG, "[obs-netint-t4xx]   &ctx->enc.input_data_fifo = %p (field offset = %zu bytes)", 
          &ctx->enc.input_data_fifo, (char*)&ctx->enc.input_data_fifo - (char*)&ctx->enc);
-    blog(LOG_INFO, "[obs-netint-t4xx]   sizeof(ni_logan_enc_context_t) in plugin = %zu bytes", sizeof(ctx->enc));
-    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
+    blog(LOG_DEBUG, "[obs-netint-t4xx]   sizeof(ni_logan_enc_context_t) in plugin = %zu bytes", sizeof(ctx->enc));
+    blog(LOG_DEBUG, "[obs-netint-t4xx] ========================================");
+#endif
     
     if (!ctx->enc.p_session_ctx || !ctx->enc.p_encoder_params || !ctx->enc.input_data_fifo) {
         blog(LOG_ERROR, "[obs-netint-t4xx] CRITICAL: ni_logan_encode_init returned success but didn't allocate internal structures!");
@@ -1014,20 +1001,6 @@ static void netint_destroy(void *data)
         blog(LOG_WARNING, "[obs-netint-t4xx] OBS skipped flush - we'll send EOS frame now in destroy");
     }
 
-    blog(LOG_INFO,
-         "[obs-netint-t4xx][debug] Frame counters: queued=%llu sent=%llu received=%llu frames_submitted=%llu frame_count=%llu",
-         (unsigned long long)ctx->debug_queue_count,
-         (unsigned long long)ctx->debug_send_count,
-         (unsigned long long)ctx->debug_recv_count,
-         (unsigned long long)ctx->frames_submitted,
-         (unsigned long long)ctx->frame_count);
-    blog(LOG_INFO,
-         "[obs-netint-t4xx][debug] Encode counters: total_calls=%llu frame_calls=%llu null_calls=%llu packets_delivered=%llu",
-         (unsigned long long)ctx->debug_encode_calls,
-         (unsigned long long)ctx->debug_encode_frame_calls,
-         (unsigned long long)ctx->debug_encode_null_calls,
-         (unsigned long long)ctx->debug_packets_delivered);
-    
 #ifdef DEBUG_NETINT_PLUGIN
     /* Validate magic before destroy */
     if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
@@ -1324,22 +1297,6 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
                                    src_height);
     }
 
-    int64_t pts_delta = (ctx->debug_queue_count == 0) ? 0 : (job->pts - ctx->debug_last_queue_pts);
-    ctx->debug_last_queue_pts = job->pts;
-    ctx->debug_queue_count++;
-    if (ctx->debug_queue_count <= 10 || ctx->debug_queue_count % 60 == 0) {
-        double pts_ms = (ctx->enc.timebase_den > 0)
-                             ? (job->pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                             : 0.0;
-        double delta_ms = (ctx->enc.timebase_den > 0)
-                               ? (pts_delta * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                               : 0.0;
-        blog(LOG_INFO,
-             "[obs-netint-t4xx][debug] Queue frame #%llu pts=%lld (%.3f ms) delta=%lld (%.3f ms) linesize0=%d",
-             (unsigned long long)ctx->debug_queue_count, (long long)job->pts, pts_ms,
-             (long long)pts_delta, delta_ms, frame->linesize[0]);
-    }
-
     netint_enqueue_job(ctx, job, true);
     return true;
 }
@@ -1455,28 +1412,6 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
     if (!job->end_of_stream) {
         ctx->frame_count++;
 
-        int64_t pts_delta = (ctx->debug_send_count == 0) ? 0 : (job->pts - ctx->debug_last_send_pts);
-        ctx->debug_last_send_pts = job->pts;
-        ctx->debug_send_count++;
-
-        if (ctx->debug_send_count <= 10 || ctx->debug_send_count % 60 == 0) {
-            double pts_ms = (ctx->enc.timebase_den > 0)
-                                ? (job->pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                                : 0.0;
-            double delta_ms = (ctx->enc.timebase_den > 0)
-                                  ? (pts_delta * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                                  : 0.0;
-
-            pthread_mutex_lock(&ctx->frame_queue_mutex);
-            int pending = ctx->pending_jobs;
-            int inflight = ctx->inflight_frames;
-            pthread_mutex_unlock(&ctx->frame_queue_mutex);
-
-            blog(LOG_INFO,
-                 "[obs-netint-t4xx][debug] Send frame #%llu pts=%lld (%.3f ms) delta=%lld (%.3f ms) inflight(before)=%d pending=%d",
-                 (unsigned long long)ctx->debug_send_count, (long long)job->pts, pts_ms,
-                 (long long)pts_delta, delta_ms, inflight, pending);
-        }
     }
 
     ctx->consecutive_errors = 0;
@@ -1546,24 +1481,6 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
                     pkt_keyframe = obs_hevc_keyframe(copied_data, copied_size);
                 } else {
                     pkt_keyframe = obs_avc_keyframe(copied_data, copied_size);
-                }
-
-                int64_t pts_delta = (ctx->debug_recv_count == 0) ? 0 : (pkt_pts - ctx->debug_last_recv_pts);
-                ctx->debug_last_recv_pts = pkt_pts;
-                ctx->debug_recv_count++;
-
-                if (ctx->debug_recv_count <= 10 || ctx->debug_recv_count % 60 == 0) {
-                    double pts_ms = (ctx->enc.timebase_den > 0)
-                                        ? (pkt_pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                                        : 0.0;
-                    double delta_ms = (ctx->enc.timebase_den > 0)
-                                          ? (pts_delta * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                                          : 0.0;
-                    blog(LOG_INFO,
-                         "[obs-netint-t4xx][debug] Receive pkt #%llu size=%zu pts=%lld (%.3f ms) delta=%lld (%.3f ms) key=%d",
-                         (unsigned long long)ctx->debug_recv_count, copied_size,
-                         (long long)pkt_pts, pts_ms, (long long)pts_delta, delta_ms,
-                         pkt_keyframe ? 1 : 0);
                 }
 
                 ctx->enc.encoder_eof = ni_pkt->end_of_stream;
@@ -1695,27 +1612,6 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
     NETINT_VALIDATE_ENC_CONTEXT(ctx, "netint_encode entry");
 
-    ctx->debug_encode_calls++;
-    if (frame) {
-        ctx->debug_encode_frame_calls++;
-        if (ctx->debug_encode_frame_calls <= 10 || ctx->debug_encode_frame_calls % 60 == 0) {
-            double pts_ms = (ctx->enc.timebase_den > 0)
-                                ? (frame->pts * 1000.0 * ctx->enc.timebase_num / ctx->enc.timebase_den)
-                                : 0.0;
-            blog(LOG_INFO,
-                 "[obs-netint-t4xx][debug] encode() call #%llu with frame pts=%lld (%.3f ms)",
-                 (unsigned long long)ctx->debug_encode_calls,
-                 (long long)frame->pts, pts_ms);
-        }
-    } else {
-        ctx->debug_encode_null_calls++;
-        if (ctx->debug_encode_null_calls <= 5 || ctx->debug_encode_null_calls % 60 == 0) {
-            blog(LOG_INFO,
-                 "[obs-netint-t4xx][debug] encode() call #%llu with NULL frame (flush=%d)",
-                 (unsigned long long)ctx->debug_encode_calls, ctx->flushing ? 1 : 0);
-        }
-    }
-
     /* Check for packets produced by IO thread */
     pthread_mutex_lock(&ctx->queue_mutex);
     struct netint_pkt *pkt = ctx->pkt_queue_head;
@@ -1748,7 +1644,6 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
         }
 
         bfree(pkt);
-        ctx->debug_packets_delivered++;
         *received = true;
         delivered_packet = true;
     }

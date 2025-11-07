@@ -47,7 +47,7 @@ static void netint_log_callback(int level, const char *fmt, va_list vl)
             obs_level = LOG_ERROR;
             break;
         case 3: /* NI_LOG_INFO */
-            obs_level = LOG_INFO;
+            obs_level = LOG_DEBUG;
             break;
         case 4: /* NI_LOG_DEBUG */
             obs_level = LOG_DEBUG;
@@ -56,7 +56,7 @@ static void netint_log_callback(int level, const char *fmt, va_list vl)
             obs_level = LOG_DEBUG;
             break;
         default:
-            obs_level = LOG_INFO;
+            obs_level = LOG_DEBUG;
             break;
     }
     
@@ -244,98 +244,44 @@ bool ni_libxcoder_open(void)
         return true;
     }
 
-    /* ============================================================================
-     * TEMPORARY DEBUG: Use specific DLL path for debugging
-     * 
-     * TODO: REMOVE THIS AFTER DEBUGGING IS COMPLETE!
-     * 
-     * This hardcoded path ensures we're using the exact DLL version from the
-     * libxcoder source directory, not some other version in PATH.
-     * 
-     * Currently using: x64/DebugDLL/libxcoder_logan.dll (has debug symbols and error messages)
-     * 
-     * Other options to try if DebugDLL doesn't exist:
-     * - build/libxcoder_logan.dll (last built version)
-     * - x64/ReleaseDLL/libxcoder_logan.dll (optimized, less error info)
-     * 
-     * For production, we should use the normal library search paths.
-     * ============================================================================ */
-#ifdef _WIN32
-    /* Try DebugDLL first (best for debugging with error messages) */
-    const char *debug_dll_path = "E:\\src\\t408\\t408\\V3.5.1\\release\\libxcoder_logan\\NI_MSVS2022_XCODER\\x64\\DebugDLL\\libxcoder_logan.dll";
-    
-    /* Fallback to build directory if DebugDLL doesn't exist */
-    const char *fallback_dll_path = "E:\\src\\t408\\t408\\V3.5.1\\release\\libxcoder_logan\\NI_MSVS2022_XCODER\\build\\libxcoder_logan.dll";
-    
-    /* Log which DLL we're trying to load */
-    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
-    blog(LOG_INFO, "[obs-netint-t4xx] DEBUG MODE: Using hardcoded DLL path");
-    blog(LOG_INFO, "[obs-netint-t4xx] TODO: REMOVE THIS AFTER DEBUGGING!");
-    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
-    blog(LOG_INFO, "[obs-netint-t4xx] Primary:  %s", debug_dll_path);
-    blog(LOG_INFO, "[obs-netint-t4xx] Fallback: %s", fallback_dll_path);
-#endif
-    
     /* Check for environment variable override of library path */
     /* This is useful for development/testing or non-standard installations */
     const char *override_path = getenv("NETINT_LIBXCODER_PATH");
-    const char *libname;
-    
+#ifdef _WIN32
+    const char *default_lib_name = "libxcoder_logan.dll";
+#else
+    const char *default_lib_name = "libxcoder_logan.so";
+#endif
+
+    const char *libname = NULL;
     if (override_path && *override_path) {
         libname = override_path;
-        blog(LOG_INFO, "[obs-netint-t4xx] Using DLL from NETINT_LIBXCODER_PATH: %s", libname);
+        blog(LOG_INFO, "[obs-netint-t4xx] Attempting to load libxcoder from NETINT_LIBXCODER_PATH: %s", libname);
     } else {
-        /* Use platform-specific default library name */
-#ifdef _WIN32
-        /* DEBUG: Try DebugDLL first, fallback to build directory */
-        libname = debug_dll_path;
-        blog(LOG_INFO, "[obs-netint-t4xx] Trying primary path (DebugDLL): %s", libname);
-#else
-        libname = "libxcoder_logan.so";
-#endif
+        libname = default_lib_name;
     }
 
     /* Load the shared library using OBS platform abstraction */
     /* os_dlopen() handles platform-specific loading (LoadLibrary on Windows, dlopen on Linux) */
     s_lib_handle = os_dlopen(libname);
-    
+
 #ifdef _WIN32
-    /* If DebugDLL failed, try fallback to build directory */
-    if (!s_lib_handle && !override_path) {
-        blog(LOG_WARNING, "[obs-netint-t4xx] DebugDLL not found, trying fallback path...");
-        libname = fallback_dll_path;
-        blog(LOG_INFO, "[obs-netint-t4xx] Trying fallback path (build): %s", libname);
+    if (!s_lib_handle && override_path && *override_path) {
+        /* Fall back to default search if override failed */
+        libname = default_lib_name;
         s_lib_handle = os_dlopen(libname);
     }
 #endif
     
     if (!s_lib_handle) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] ========================================");
-        blog(LOG_ERROR, "[obs-netint-t4xx] FAILED TO LOAD libxcoder_logan.dll");
-        blog(LOG_ERROR, "[obs-netint-t4xx] ========================================");
-        blog(LOG_ERROR, "[obs-netint-t4xx] All attempts failed:");
-#ifdef _WIN32
-        blog(LOG_ERROR, "[obs-netint-t4xx]   1. NETINT_LIBXCODER_PATH: %s", 
-             override_path ? override_path : "(not set)");
-        blog(LOG_ERROR, "[obs-netint-t4xx]   2. DebugDLL: %s", debug_dll_path);
-        blog(LOG_ERROR, "[obs-netint-t4xx]   3. Build directory: %s", fallback_dll_path);
-#else
-        blog(LOG_ERROR, "[obs-netint-t4xx]   %s", libname);
-#endif
-        blog(LOG_ERROR, "[obs-netint-t4xx] ========================================");
-        blog(LOG_ERROR, "[obs-netint-t4xx] Troubleshooting:");
-        blog(LOG_ERROR, "[obs-netint-t4xx]   1. Rebuild libxcoder from source (NI_MSVS2022_XCODER project)");
-        blog(LOG_ERROR, "[obs-netint-t4xx]   2. Use DebugDLL|x64 configuration");
-        blog(LOG_ERROR, "[obs-netint-t4xx]   3. Check DLL dependencies with Dependency Walker");
-        blog(LOG_ERROR, "[obs-netint-t4xx]   4. Unset NETINT_LIBXCODER_PATH environment variable");
-        blog(LOG_ERROR, "[obs-netint-t4xx] ========================================");
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to load libxcoder library (last attempt: %s)", libname);
+        if (override_path && *override_path) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Ensure NETINT_LIBXCODER_PATH points to a valid libxcoder binary");
+        }
         return false;
     }
     
-    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
-    blog(LOG_INFO, "[obs-netint-t4xx] DLL LOADED SUCCESSFULLY:");
-    blog(LOG_INFO, "[obs-netint-t4xx]   %s", libname);
-    blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
+    blog(LOG_INFO, "[obs-netint-t4xx] Loaded libxcoder library from %s", libname);
 
     /* Resolve required symbols - these MUST be present for encoding to work */
     /* The RESOLVE macro simplifies the repetitive os_dlsym() + error checking pattern */
@@ -395,19 +341,14 @@ bool ni_libxcoder_open(void)
     /* Optional logging API - redirect libxcoder logs to OBS logging */
     p_ni_log_set_callback = (void *)os_dlsym(s_lib_handle, "ni_log_set_callback");
     if (p_ni_log_set_callback) {
-        blog(LOG_INFO, "[obs-netint-t4xx] Setting up log callback to capture libxcoder logs...");
+        blog(LOG_INFO, "[obs-netint-t4xx] Redirecting libxcoder log output to OBS");
         p_ni_log_set_callback(netint_log_callback);
-        blog(LOG_INFO, "[obs-netint-t4xx] ╔════════════════════════════════════════════════════╗");
-        blog(LOG_INFO, "[obs-netint-t4xx] ║ LIBXCODER LOGGING REDIRECTED TO OBS              ║");
-        blog(LOG_INFO, "[obs-netint-t4xx] ║ All libxcoder ni_log() output will now appear    ║");
-        blog(LOG_INFO, "[obs-netint-t4xx] ║ in OBS log with [libxcoder] prefix                ║");
-        blog(LOG_INFO, "[obs-netint-t4xx] ╚════════════════════════════════════════════════════╝");
     } else {
         blog(LOG_WARNING, "[obs-netint-t4xx] ni_log_set_callback not found - libxcoder logs will not appear in OBS log");
     }
 
 #undef RESOLVE
-    blog(LOG_INFO, "[obs-netint-t4xx] Successfully loaded %s", libname);
+    blog(LOG_INFO, "[obs-netint-t4xx] libxcoder initialization complete");
     return true;
 }
 
