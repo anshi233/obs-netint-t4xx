@@ -52,6 +52,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <stdio.h>
 #include "netint-libxcoder-shim.h"
 
 /**
@@ -185,6 +186,8 @@ struct netint_ctx {
     int codec_type;                    /**< Codec type: 0 = H.264, 1 = H.265 (HEVC) */
     uint64_t frame_count;              /**< Total frames processed (for start_of_stream logic) */
     int keyint_frames;                 /**< Keyframe interval in frames */
+    int qp_value;                      /**< Constant QP value used when rate control is disabled */
+    bool lossless;                     /**< Lossless encoding enabled (HEVC only, RC disabled) */
 
     /* Error tracking and health monitoring */
     int consecutive_errors;            /**< Count of consecutive errors (reset on success) */
@@ -481,6 +484,19 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     /* Repeat headers setting: if true, attach SPS/PPS to every keyframe */
     /* This is useful for streaming where clients may join mid-stream */
     ctx->repeat_headers = obs_data_get_bool(settings, "repeat_headers");
+    ctx->qp_value = (int)obs_data_get_int(settings, "qp");
+    if (ctx->qp_value < 0)
+        ctx->qp_value = 0;
+    else if (ctx->qp_value > 51)
+        ctx->qp_value = 51;
+    if (ctx->codec_type == 1) {
+        ctx->lossless = obs_data_get_bool(settings, "lossless");
+        if (ctx->lossless && (!ctx->rc_mode || strcmp(ctx->rc_mode, "DISABLED") != 0)) {
+            blog(LOG_WARNING, "[obs-netint-t4xx] Lossless requested but rate control not disabled; lossless will be ignored");
+        }
+    } else {
+        ctx->lossless = false;
+    }
     if (ctx->repeat_headers) {
         ctx->enc.spsPpsAttach = 1;
     }
@@ -609,42 +625,67 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         int gop_ret = p_ni_logan_encoder_params_set_value(params, "gopPresetIdx", gop_value, session_ctx);
         blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s: ret=%d", gop_desc, gop_ret);
 
-        /* CRITICAL: Enable rate control first! Without this, encoder uses Constant QP mode and ignores bitrate! */
-        p_ni_logan_encoder_params_set_value(params, "RcEnable", "1", session_ctx);
-        blog(LOG_INFO, "[obs-netint-t4xx] Rate control ENABLED (RcEnable=1)");
+        const bool rc_disabled = (ctx->rc_mode && strcmp(ctx->rc_mode, "DISABLED") == 0);
 
-        /* Set bitrate and framerate parameters */
-        char bitrate_str[32];
-        char framerate_str[32];
-        char framerate_denom_str[32];
+        if (rc_disabled) {
+            p_ni_logan_encoder_params_set_value(params, "RcEnable", "0", session_ctx);
+            blog(LOG_INFO, "[obs-netint-t4xx] Rate control DISABLED (RcEnable=0)");
 
-        sprintf(bitrate_str, "%lld", (long long)ctx->enc.bit_rate);
-        sprintf(framerate_str, "%d", ctx->enc.timebase_den);
-        sprintf(framerate_denom_str, "%d", ctx->enc.timebase_num);
+            char qp_str[16];
+            snprintf(qp_str, sizeof(qp_str), "%d", ctx->qp_value);
+            p_ni_logan_encoder_params_set_value(params, "intraQP", qp_str, session_ctx);
+            p_ni_logan_encoder_params_set_value(params, "minQp", qp_str, session_ctx);
+            p_ni_logan_encoder_params_set_value(params, "maxQp", qp_str, session_ctx);
+            blog(LOG_INFO, "[obs-netint-t4xx] Constant QP mode: intraQP/minQp/maxQp set to %d", ctx->qp_value);
 
-        p_ni_logan_encoder_params_set_value(params, "bitrate", bitrate_str, session_ctx);
-        blog(LOG_INFO, "[obs-netint-t4xx] Bitrate parameter set to %lld bps (%d kbps): ret=0",
-             (long long)ctx->enc.bit_rate, (int)(ctx->enc.bit_rate / 1000));
-        
-        p_ni_logan_encoder_params_set_value(params, "frameRate", framerate_str, session_ctx);
-        p_ni_logan_encoder_params_set_value(params, "frameRateDenom", framerate_denom_str, session_ctx);
-        blog(LOG_INFO, "[obs-netint-t4xx] Framerate parameters: %d/%d (%.2f fps), ret=0,0",
-             ctx->enc.timebase_den, ctx->enc.timebase_num,
-             ctx->enc.timebase_den / (double)ctx->enc.timebase_num);
-        
-        p_ni_logan_encoder_params_set_value(params, "RcInitDelay", "3000", session_ctx);
-        blog(LOG_INFO, "[obs-netint-t4xx] VBV buffer size (RCInitDelay) set to 3000 ms: ret=0");
+            /* Ensure RC-specific flags are cleared */
+            p_ni_logan_encoder_params_set_value(params, "cbr", "0", session_ctx);
 
-        /* Set rate control mode: CBR (constant) or VBR (variable) */
-        /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
-        if (ctx->rc_mode) {
-            if (strcmp(ctx->rc_mode, "CBR") == 0) {
+            if (ctx->codec_type == 1 && ctx->lossless) {
+                p_ni_logan_encoder_params_set_value(params, "losslessEnable", "1", session_ctx);
+                blog(LOG_INFO, "[obs-netint-t4xx] Lossless HEVC encoding enabled");
+            } else {
+                p_ni_logan_encoder_params_set_value(params, "losslessEnable", "0", session_ctx);
+            }
+        } else {
+            /* CRITICAL: Enable rate control first! Without this, encoder uses Constant QP mode and ignores bitrate! */
+            p_ni_logan_encoder_params_set_value(params, "RcEnable", "1", session_ctx);
+            blog(LOG_INFO, "[obs-netint-t4xx] Rate control ENABLED (RcEnable=1)");
+
+            /* Set bitrate and framerate parameters */
+            char bitrate_str[32];
+            char framerate_str[32];
+            char framerate_denom_str[32];
+
+            sprintf(bitrate_str, "%lld", (long long)ctx->enc.bit_rate);
+            sprintf(framerate_str, "%d", ctx->enc.timebase_den);
+            sprintf(framerate_denom_str, "%d", ctx->enc.timebase_num);
+
+            p_ni_logan_encoder_params_set_value(params, "bitrate", bitrate_str, session_ctx);
+            blog(LOG_INFO, "[obs-netint-t4xx] Bitrate parameter set to %lld bps (%d kbps): ret=0",
+                 (long long)ctx->enc.bit_rate, (int)(ctx->enc.bit_rate / 1000));
+            
+            p_ni_logan_encoder_params_set_value(params, "frameRate", framerate_str, session_ctx);
+            p_ni_logan_encoder_params_set_value(params, "frameRateDenom", framerate_denom_str, session_ctx);
+            blog(LOG_INFO, "[obs-netint-t4xx] Framerate parameters: %d/%d (%.2f fps), ret=0,0",
+                 ctx->enc.timebase_den, ctx->enc.timebase_num,
+                 ctx->enc.timebase_den / (double)ctx->enc.timebase_num);
+            
+            p_ni_logan_encoder_params_set_value(params, "RcInitDelay", "3000", session_ctx);
+            blog(LOG_INFO, "[obs-netint-t4xx] VBV buffer size (RCInitDelay) set to 3000 ms: ret=0");
+
+            /* Set rate control mode: CBR (constant) or VBR (variable) */
+            /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
+            if (ctx->rc_mode && strcmp(ctx->rc_mode, "CBR") == 0) {
                 p_ni_logan_encoder_params_set_value(params, "cbr", "1", session_ctx);
                 blog(LOG_INFO, "[obs-netint-t4xx] Rate control mode: CBR (constant bitrate)");
             } else {
                 p_ni_logan_encoder_params_set_value(params, "cbr", "0", session_ctx);
                 blog(LOG_INFO, "[obs-netint-t4xx] Rate control mode: VBR (variable bitrate)");
             }
+
+            /* Lossless is incompatible with rate control */
+            p_ni_logan_encoder_params_set_value(params, "losslessEnable", "0", session_ctx);
         }
         
         /* Set encoder profile - maps string names to codec-specific profile IDs */
@@ -1560,6 +1601,12 @@ static void netint_h264_get_defaults(obs_data_t *settings)
     
     /* Default rate control: CBR (constant bitrate) - better for streaming */
     obs_data_set_default_string(settings, "rc_mode", "CBR");
+
+    /* Default QP when rate control is disabled */
+    obs_data_set_default_int(settings, "qp", 22);
+
+    /* Lossless disabled by default */
+    obs_data_set_default_bool(settings, "lossless", false);
     
     /* Default profile: high (best quality for H.264) */
     obs_data_set_default_string(settings, "profile", "high");
@@ -1585,6 +1632,12 @@ static void netint_h265_get_defaults(obs_data_t *settings)
     
     /* Default rate control: CBR (constant bitrate) - better for streaming */
     obs_data_set_default_string(settings, "rc_mode", "CBR");
+
+    /* Default QP when rate control is disabled */
+    obs_data_set_default_int(settings, "qp", 22);
+
+    /* Lossless disabled by default */
+    obs_data_set_default_bool(settings, "lossless", false);
     
     /* Default profile: main (H.265 only supports main and main10) */
     obs_data_set_default_string(settings, "profile", "main");
@@ -1620,6 +1673,9 @@ static obs_properties_t *netint_h264_get_properties(void *data)
     obs_property_t *rc = obs_properties_add_list(props, "rc_mode", "Rate Control", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(rc, "CBR", "CBR");
     obs_property_list_add_string(rc, "VBR", "VBR");
+    obs_property_list_add_string(rc, "Disabled (Constant QP)", "DISABLED");
+
+    obs_properties_add_int(props, "qp", "QP (RC Disabled)", 0, 51, 1);
     
     /* H.264 Profile selection: baseline, main, or high */
     obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -1684,6 +1740,10 @@ static obs_properties_t *netint_h265_get_properties(void *data)
     obs_property_t *rc = obs_properties_add_list(props, "rc_mode", "Rate Control", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(rc, "CBR", "CBR");
     obs_property_list_add_string(rc, "VBR", "VBR");
+    obs_property_list_add_string(rc, "Disabled (Constant QP)", "DISABLED");
+
+    obs_properties_add_int(props, "qp", "QP (RC Disabled)", 0, 51, 1);
+    obs_properties_add_bool(props, "lossless", "Lossless (HEVC only, requires RC Disabled)");
     
     /* H.265 Profile selection: main or main10 ONLY */
     obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
