@@ -51,6 +51,7 @@
 #include <util/threading.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include "netint-libxcoder-shim.h"
 
 /**
@@ -70,6 +71,15 @@ struct netint_pkt {
     bool keyframe;        /**< true if this is a keyframe (I-frame), false for P/B frames */
     int priority;         /**< Packet priority (higher = more important for streaming) */
     struct netint_pkt *next; /**< Next packet in queue (linked list) */
+};
+
+struct netint_frame_job {
+    uint8_t *buffer;                  /**< Host copy of frame data laid out in HW format */
+    size_t buffer_size;               /**< Size of the buffer in bytes */
+    int64_t pts;                      /**< Presentation/Decode timestamp */
+    bool start_of_stream;             /**< Marks first frame to hardware */
+    bool end_of_stream;               /**< Signals EOS to hardware */
+    struct netint_frame_job *next;    /**< Next job in queue */
 };
 
 /**
@@ -136,24 +146,37 @@ struct netint_ctx {
     bool got_headers;                 /**< true if headers were obtained (either during init or from first packet) */
     bool flushing;                    /**< true when encoder is being flushed (no more input frames) */
     
-    /* Background thread design - necessary because encode_receive() blocks! */
-    pthread_t recv_thread;            /**< Background thread that calls blocking encode_receive() */
+    /* Background worker that manages both send and receive with pipelining */
+    pthread_t io_thread;              /**< Background thread that handles encode_send/receive */
     pthread_mutex_t queue_mutex;      /**< Protects packet queue access ONLY */
-    pthread_mutex_t io_mutex;         /**< Serializes libxcoder encode_send/receive FIFO access */
+    pthread_mutex_t io_mutex;         /**< Serializes access to libxcoder context */
+    pthread_mutex_t frame_queue_mutex; /**< Protects pending frame job queue */
+    pthread_cond_t frame_queue_cond;  /**< Signals availability of frame jobs */
+    bool queue_mutex_initialized;
+    bool io_mutex_initialized;
+    bool frame_queue_mutex_initialized;
+    bool frame_queue_cond_initialized;
     volatile bool stop_thread;        /**< Signal to background thread to stop */
-    bool thread_created;              /**< true if recv_thread was successfully created */
+    bool thread_created;              /**< true if io_thread was successfully created */
     struct netint_pkt *pkt_queue_head; /**< Head of packet queue (oldest packet) */
     struct netint_pkt *pkt_queue_tail; /**< Tail of packet queue (newest packet) */
+
+    struct netint_frame_job *frame_queue_head; /**< Pending frame jobs (host buffers ready for send) */
+    struct netint_frame_job *frame_queue_tail;
+    int pending_jobs;                 /**< Number of queued frame jobs */
+    int inflight_frames;              /**< Count of frames submitted to HW but not yet drained */
+    int max_inflight;                 /**< Maximum frames to keep in-flight before draining */
+    uint64_t frames_submitted;        /**< Total frames enqueued (for start-of-stream decisions) */
 
     /* Debug flags */
     bool debug_eos_sent;              /**< true if debug EOS was already sent */
 
-    /* Frame buffering for batch processing like xcoder_logan */
-    struct {
-        void *frames[60];             /**< Buffer for incoming frames */
-        int count;                    /**< Number of frames in buffer */
-        int capacity;                 /**< Maximum frames to buffer before processing batch */
-    } frame_buffer;
+    /* Precomputed hardware frame layout */
+    int hw_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+    int hw_height[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+    size_t hw_plane_size[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+    size_t hw_plane_offset[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+    size_t hw_frame_size;             /**< Total bytes for one HW-formatted frame */
 
     char *rc_mode;                     /**< Rate control mode: "CBR" or "VBR" */
     char *profile;                      /**< Encoder profile: H.264="baseline"/"main"/"high", H.265="main"/"main10" */
@@ -205,10 +228,15 @@ static const char *netint_h265_get_name(void *type_data)
 
 /* Forward declarations */
 static void netint_destroy(void *data);
-static void *netint_recv_thread(void *data);
-static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *frame,
-                             bool start_of_stream, bool end_of_stream);
-static bool netint_send_eos_frame(struct netint_ctx *ctx);
+static void *netint_io_thread(void *data);
+static void netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame);
+static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool wait_for_job);
+static void netint_free_job(struct netint_frame_job *job);
+static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *frame);
+static bool netint_queue_eos(struct netint_ctx *ctx);
+static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job);
+static bool netint_hw_receive_once(struct netint_ctx *ctx);
+static void netint_hw_drain(struct netint_ctx *ctx, bool drain_all);
 
 /**
  * @brief Simple error logging helper
@@ -298,6 +326,13 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     ctx->total_errors = 0;
     ctx->encoder_start_time = os_gettime_ns();
     ctx->frame_count = 0;
+    ctx->frames_submitted = 0;
+    ctx->pending_jobs = 0;
+    ctx->inflight_frames = 0;
+    ctx->pkt_queue_head = NULL;
+    ctx->pkt_queue_tail = NULL;
+    ctx->frame_queue_head = NULL;
+    ctx->frame_queue_tail = NULL;
     
 #ifdef DEBUG_NETINT_PLUGIN
     /* Initialize debug magic for validation - ALWAYS set this! */
@@ -313,10 +348,6 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     /* Zero-initialize encoder context structure (EMBEDDED, not allocated) */
     memset(&ctx->enc, 0, sizeof(ctx->enc));
 
-    /* Initialize frame buffer for batch processing like xcoder_logan */
-    ctx->frame_buffer.count = 0;
-    ctx->frame_buffer.capacity = 1;  /* Process frames immediately - OBS reuses frame buffer! */
-    
     /* Set basic encoder parameters */
     ctx->enc.dev_enc_idx = 1;  /* H/W ID 1 = encoder (H/W ID 0 = decoder) */
     ctx->enc.keep_alive_timeout = 3;  /* Default timeout in seconds */
@@ -408,6 +439,29 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     /* Set pixel format - currently only YUV420P is supported */
     /* YUV420P = Planar YUV 4:2:0 (separate Y, U, V planes) */
     ctx->enc.pix_fmt = NI_LOGAN_PIX_FMT_YUV420P;
+
+    memset(ctx->hw_stride, 0, sizeof(ctx->hw_stride));
+    memset(ctx->hw_height, 0, sizeof(ctx->hw_height));
+    memset(ctx->hw_plane_size, 0, sizeof(ctx->hw_plane_size));
+    memset(ctx->hw_plane_offset, 0, sizeof(ctx->hw_plane_offset));
+
+    int bit_depth_factor = 1; /* Only 8-bit supported by OBS today */
+    int is_h264 = (ctx->codec_type == 0) ? 1 : 0;
+    p_ni_logan_get_hw_yuv420p_dim(ctx->enc.width, ctx->enc.height, bit_depth_factor, is_h264,
+                                  ctx->hw_stride, ctx->hw_height);
+
+    ctx->hw_frame_size = 0;
+    for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+        ctx->hw_plane_offset[i] = ctx->hw_frame_size;
+        if (ctx->hw_stride[i] > 0 && ctx->hw_height[i] > 0) {
+            ctx->hw_plane_size[i] = (size_t)ctx->hw_stride[i] * (size_t)ctx->hw_height[i];
+            ctx->hw_frame_size += ctx->hw_plane_size[i];
+        } else {
+            ctx->hw_plane_size[i] = 0;
+        }
+    }
+
+    ctx->max_inflight = 4; /* Allow up to 4 frames queued in hardware before draining */
     
     /* Initialize color space parameters (required by library) */
     ctx->enc.color_primaries = 2;  /* NI_COL_PRI_UNSPECIFIED */
@@ -716,41 +770,67 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
      * blocks internally. Hardware won't process frames until output is drained!
      */
     
-    /* Initialize mutex FIRST (before starting thread!) */
-    /* NOTE: Only need ONE mutex for the packet queue */
-    /* Library's FIFO is designed for concurrent send/receive without external mutex */
     if (pthread_mutex_init(&ctx->queue_mutex, NULL) != 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize queue mutex");
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize packet queue mutex");
         netint_destroy(ctx);
         return NULL;
     }
+    ctx->queue_mutex_initialized = true;
 
     if (pthread_mutex_init(&ctx->io_mutex, NULL) != 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize IO mutex");
         pthread_mutex_destroy(&ctx->queue_mutex);
+        ctx->queue_mutex_initialized = false;
         netint_destroy(ctx);
         return NULL;
     }
-    
-    /* Initialize queue and thread state */
-    ctx->pkt_queue_head = NULL;
-    ctx->pkt_queue_tail = NULL;
+    ctx->io_mutex_initialized = true;
+
+    if (pthread_mutex_init(&ctx->frame_queue_mutex, NULL) != 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame queue mutex");
+        pthread_mutex_destroy(&ctx->io_mutex);
+        ctx->io_mutex_initialized = false;
+        pthread_mutex_destroy(&ctx->queue_mutex);
+        ctx->queue_mutex_initialized = false;
+        netint_destroy(ctx);
+        return NULL;
+    }
+    ctx->frame_queue_mutex_initialized = true;
+
+    if (pthread_cond_init(&ctx->frame_queue_cond, NULL) != 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame queue condition variable");
+        pthread_mutex_destroy(&ctx->frame_queue_mutex);
+        ctx->frame_queue_mutex_initialized = false;
+        pthread_mutex_destroy(&ctx->io_mutex);
+        ctx->io_mutex_initialized = false;
+        pthread_mutex_destroy(&ctx->queue_mutex);
+        ctx->queue_mutex_initialized = false;
+        netint_destroy(ctx);
+        return NULL;
+    }
+    ctx->frame_queue_cond_initialized = true;
+
     ctx->stop_thread = false;
     ctx->thread_created = false;
     ctx->flushing = false;
-    
-    /* Start background receive thread */
-    if (pthread_create(&ctx->recv_thread, NULL, netint_recv_thread, ctx) != 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to create receive thread");
+
+    if (pthread_create(&ctx->io_thread, NULL, netint_io_thread, ctx) != 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to create IO thread");
+        pthread_cond_destroy(&ctx->frame_queue_cond);
+        ctx->frame_queue_cond_initialized = false;
+        pthread_mutex_destroy(&ctx->frame_queue_mutex);
+        ctx->frame_queue_mutex_initialized = false;
         pthread_mutex_destroy(&ctx->io_mutex);
+        ctx->io_mutex_initialized = false;
         pthread_mutex_destroy(&ctx->queue_mutex);
+        ctx->queue_mutex_initialized = false;
         netint_destroy(ctx);
         return NULL;
     }
-    
+
     ctx->thread_created = true;
-    blog(LOG_INFO, "[obs-netint-t4xx] Background receive thread started successfully");
-    blog(LOG_INFO, "[obs-netint-t4xx] Encoder creation complete (background thread design)");
+    blog(LOG_INFO, "[obs-netint-t4xx] Background IO thread started successfully");
+    blog(LOG_INFO, "[obs-netint-t4xx] Encoder creation complete (pipelined design)");
     return ctx;
 fail:
     /* Cleanup all allocated resources on any failure */
@@ -813,53 +893,42 @@ static void netint_destroy(void *data)
      * Send EOS frame if not already done (OBS doesn't call flush for this encoder)
      * ===================================================================
      */
-    if (!ctx->flushing && ctx->enc.p_session_ctx) {
-        blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
-        blog(LOG_INFO, "[obs-netint-t4xx] Sending EOS frame in destroy (OBS skipped flush call)");
-        blog(LOG_INFO, "[obs-netint-t4xx] ========================================");
-
-        if (netint_send_eos_frame(ctx)) {
-            ctx->flushing = true;
-
-            blog(LOG_INFO, "[obs-netint-t4xx] ⏳ Waiting for encoder EOS acknowledgment (destroy path)...");
-            int wait_count = 0;
-            const int max_wait_ms = 3000;
-            const int sleep_ms = 10;
-
-            while (!ctx->enc.encoder_eof && wait_count < (max_wait_ms / sleep_ms)) {
-                os_sleep_ms(sleep_ms);
-                wait_count++;
-
-                if (wait_count % 100 == 0) {
-                    blog(LOG_INFO, "[obs-netint-t4xx] Still waiting for EOS acknowledgment... (%d ms)",
-                         wait_count * sleep_ms);
-                }
-            }
-
-            if (ctx->enc.encoder_eof) {
-                blog(LOG_INFO, "[obs-netint-t4xx] ✅ Encoder acknowledged EOS after %d ms",
-                     wait_count * sleep_ms);
-            } else {
-                blog(LOG_WARNING, "[obs-netint-t4xx] ⚠️ Timeout waiting for EOS acknowledgment after %d ms",
-                     max_wait_ms);
-            }
-        } else {
-            blog(LOG_ERROR, "[obs-netint-t4xx] ❌ Failed to send EOS frame during destroy");
-        }
-    }
-    
-    /* ===================================================================
-     * Stop background receive thread
-     * ===================================================================
-     */
     if (ctx->thread_created) {
-        blog(LOG_INFO, "[obs-netint-t4xx] Stopping receive thread...");
-        ctx->stop_thread = true;
-        
-        /* Wait for thread to finish (may take time if encode_receive is blocking) */
-        pthread_join(ctx->recv_thread, NULL);
-        blog(LOG_INFO, "[obs-netint-t4xx] Receive thread stopped");
+        if (!ctx->flushing && ctx->enc.p_session_ctx) {
+            blog(LOG_INFO, "[obs-netint-t4xx] Queueing EOS job during destroy");
+            if (netint_queue_eos(ctx)) {
+                ctx->flushing = true;
+            } else {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to queue EOS job during destroy");
+            }
+        }
+
+        blog(LOG_INFO, "[obs-netint-t4xx] Stopping IO thread...");
+        if (ctx->frame_queue_mutex_initialized) {
+            pthread_mutex_lock(&ctx->frame_queue_mutex);
+            ctx->stop_thread = true;
+            if (ctx->frame_queue_cond_initialized) {
+                pthread_cond_broadcast(&ctx->frame_queue_cond);
+            }
+            pthread_mutex_unlock(&ctx->frame_queue_mutex);
+        } else {
+            ctx->stop_thread = true;
+            if (ctx->frame_queue_cond_initialized) {
+                pthread_cond_broadcast(&ctx->frame_queue_cond);
+            }
+        }
+
+        pthread_join(ctx->io_thread, NULL);
+        blog(LOG_INFO, "[obs-netint-t4xx] IO thread stopped");
         ctx->thread_created = false;
+    }
+
+    /* Free any remaining frame jobs (should be none) */
+    if (ctx->frame_queue_mutex_initialized) {
+        struct netint_frame_job *pending_job = NULL;
+        while ((pending_job = netint_dequeue_job(ctx, false)) != NULL) {
+            netint_free_job(pending_job);
+        }
     }
     
     /* Free all queued packets */
@@ -874,8 +943,25 @@ static void netint_destroy(void *data)
     ctx->pkt_queue_tail = NULL;
     
     /* Destroy mutexes LAST (after thread is stopped!) */
-    pthread_mutex_destroy(&ctx->io_mutex);
-    pthread_mutex_destroy(&ctx->queue_mutex);
+    if (ctx->frame_queue_cond_initialized) {
+        pthread_cond_destroy(&ctx->frame_queue_cond);
+        ctx->frame_queue_cond_initialized = false;
+    }
+
+    if (ctx->frame_queue_mutex_initialized) {
+        pthread_mutex_destroy(&ctx->frame_queue_mutex);
+        ctx->frame_queue_mutex_initialized = false;
+    }
+
+    if (ctx->io_mutex_initialized) {
+        pthread_mutex_destroy(&ctx->io_mutex);
+        ctx->io_mutex_initialized = false;
+    }
+
+    if (ctx->queue_mutex_initialized) {
+        pthread_mutex_destroy(&ctx->queue_mutex);
+        ctx->queue_mutex_initialized = false;
+    }
     
     /* Close hardware encoder connection */
     /* We use encode_open() for initialization, so use encode_close() for cleanup */
@@ -970,182 +1056,161 @@ static bool netint_update(void *data, obs_data_t *settings)
 static void netint_get_video_info(void *data, struct video_scale_info *info)
 {
     UNUSED_PARAMETER(data);
-    /* NETINT encoder requires I420 format (planar Y, U, V separate) */
-    /* NOT NV12 (which has interleaved UV plane) */
     info->format = VIDEO_FORMAT_I420;
 }
-
-/**
- * @brief Background thread that continuously receives packets from encoder
- * 
- * CRITICAL: This thread is NECESSARY because ni_logan_encode_receive() BLOCKS
- * internally with a retry loop (up to 2000+ attempts). If we call it from the
- * OBS video thread, the entire UI freezes!
- * 
- * This thread:
- * 1. Calls encode_receive() continuously (can block - that's OK here!)
- * 2. When packet arrives, adds it to thread-safe queue
- * 3. Main thread pops packets from queue (non-blocking)
- * 
- * @param data Pointer to netint_ctx structure
- * @return NULL
- */
-static void *netint_recv_thread(void *data)
+static void netint_free_job(struct netint_frame_job *job)
 {
-    struct netint_ctx *ctx = data;
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread started");
-    
-    while (!ctx->stop_thread) {
-        uint8_t *copied_data = NULL;
-        size_t copied_size = 0;
-        int64_t pkt_pts = 0;
-        int64_t pkt_dts = 0;
-        bool pkt_keyframe = false;
-        bool got_packet = false;
-
-        pthread_mutex_lock(&ctx->io_mutex);
-        int recv_size = p_ni_logan_encode_receive(&ctx->enc);
-
-        if (recv_size > 0) {
-            ni_logan_packet_t *ni_pkt = &ctx->enc.output_pkt.data.packet;
-            int packet_size = recv_size;
-            if (ctx->enc.spsPpsAttach && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
-                packet_size += ctx->enc.spsPpsHdrLen;
-            }
-
-            copied_data = bmalloc((size_t)packet_size);
-            if (!copied_data) {
-                blog(LOG_ERROR, "[obs-netint-t4xx] [RECV THREAD] Failed to allocate packet buffer (%d bytes)", packet_size);
-            } else {
-                int first_packet_flag = ctx->enc.firstPktArrived ? 0 : 1;
-                int copy_ret = p_ni_logan_encode_copy_packet_data(&ctx->enc, copied_data,
-                                                                  first_packet_flag,
-                                                                  ctx->enc.spsPpsAttach);
-                if (copy_ret < 0) {
-                    blog(LOG_ERROR, "[obs-netint-t4xx] [RECV THREAD] encode_copy_packet_data failed (ret=%d)", copy_ret);
-                    bfree(copied_data);
-                    copied_data = NULL;
-                } else {
-                    copied_size = (size_t)packet_size;
-
-                    if (!ctx->got_headers && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
-                        if (ctx->extra) bfree(ctx->extra);
-                        ctx->extra = bmemdup(ctx->enc.p_spsPpsHdr, (size_t)ctx->enc.spsPpsHdrLen);
-                        ctx->extra_size = (size_t)ctx->enc.spsPpsHdrLen;
-                        ctx->got_headers = true;
-                        blog(LOG_INFO, "[obs-netint-t4xx] [RECV THREAD] Stored SPS/PPS extradata (%zu bytes)", ctx->extra_size);
-                    }
-
-                    pkt_pts = ni_pkt->pts;
-                    pkt_dts = ni_pkt->dts;
-                    if (pkt_pts == 0 && ctx->enc.latest_dts != 0) {
-                        pkt_pts = ctx->enc.latest_dts;
-                        pkt_dts = pkt_pts;
-                    }
-
-                    if (ctx->codec_type == 1) {
-                        pkt_keyframe = obs_hevc_keyframe(copied_data, copied_size);
-                    } else {
-                        pkt_keyframe = obs_avc_keyframe(copied_data, copied_size);
-                    }
-
-                    ctx->enc.encoder_eof = ni_pkt->end_of_stream;
-                    ctx->enc.firstPktArrived = 1;
-                    got_packet = true;
-                }
-            }
-        } else if (recv_size < 0) {
-            if (ctx->enc.encoder_eof) {
-                pthread_mutex_unlock(&ctx->io_mutex);
-                break;
-            }
-        }
-
-        pthread_mutex_unlock(&ctx->io_mutex);
-
-        if (ctx->stop_thread) {
-            if (copied_data)
-                bfree(copied_data);
-            break;
-        }
-
-        if (got_packet && copied_data) {
-            struct netint_pkt *pkt = bzalloc(sizeof(*pkt));
-            if (!pkt) {
-                blog(LOG_ERROR, "[obs-netint-t4xx] [RECV THREAD] Failed to allocate queue packet");
-                bfree(copied_data);
-            } else {
-                pkt->data = copied_data;
-                pkt->size = copied_size;
-                pkt->pts = pkt_pts;
-                pkt->dts = pkt_dts;
-                pkt->keyframe = pkt_keyframe;
-                pkt->priority = 0;
-
-                pthread_mutex_lock(&ctx->queue_mutex);
-                pkt->next = NULL;
-                if (ctx->pkt_queue_tail) {
-                    ctx->pkt_queue_tail->next = pkt;
-                    ctx->pkt_queue_tail = pkt;
-                } else {
-                    ctx->pkt_queue_head = pkt;
-                    ctx->pkt_queue_tail = pkt;
-                }
-                pthread_mutex_unlock(&ctx->queue_mutex);
-            }
-        } else {
-            if (copied_data)
-                bfree(copied_data);
-            os_sleep_ms(1);
-        }
+    if (!job) {
+        return;
     }
 
-    blog(LOG_INFO, "[obs-netint-t4xx] Receive thread stopped");
-    return NULL;
+    if (job->buffer) {
+        bfree(job->buffer);
+    }
+
+    bfree(job);
 }
 
-/**
- * @brief Encode a video frame and/or receive an encoded packet
- * 
- * Background thread design - necessary because encode_receive() BLOCKS!
- * 
- * Main thread (this function):
- * 1. Checks packet queue for available packets
- * 2. Returns packet to OBS if available
- * 3. Sends new frame to encoder (if provided)
- * 
- * Background thread (netint_recv_thread):
- * 1. Calls encode_receive() continuously (can block safely)
- * 2. Adds packets to thread-safe queue
- * 
- * @param data Encoder context pointer
- * @param frame Video frame to encode (NULL when flushing)
- * @param packet Output packet structure (filled if packet available)
- * @param received Output flag: true if packet was returned, false if no packet ready
- * @return true on success, false on error
- */
-static bool netint_send_eos_frame(struct netint_ctx *ctx)
+static void netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame)
 {
-    blog(LOG_INFO, "[obs-netint-t4xx] Sending EOS frame using high-level API");
-    return netint_send_frame(ctx, NULL, false, true);
+    pthread_mutex_lock(&ctx->frame_queue_mutex);
+
+    if (count_frame && ctx->frames_submitted == 0) {
+        job->start_of_stream = true;
+    }
+
+    if (count_frame) {
+        ctx->frames_submitted++;
+    }
+
+    job->next = NULL;
+
+    if (!ctx->frame_queue_head) {
+        ctx->frame_queue_head = job;
+        ctx->frame_queue_tail = job;
+    } else {
+        ctx->frame_queue_tail->next = job;
+        ctx->frame_queue_tail = job;
+    }
+
+    ctx->pending_jobs++;
+    pthread_cond_signal(&ctx->frame_queue_cond);
+    pthread_mutex_unlock(&ctx->frame_queue_mutex);
 }
 
-static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *frame,
-                             bool start_of_stream, bool end_of_stream)
+static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool wait_for_job)
 {
-    int width = ctx->enc.width;
-    int height = ctx->enc.height;
-    int bit_depth = 8;
-    int bit_depth_factor = 1;
-    int is_h264 = (ctx->codec_type == 0) ? 1 : 0;
-    bool allocated_buffer = false;
+    struct netint_frame_job *job = NULL;
+
+    pthread_mutex_lock(&ctx->frame_queue_mutex);
+    while (wait_for_job && !ctx->stop_thread && !ctx->frame_queue_head) {
+        pthread_cond_wait(&ctx->frame_queue_cond, &ctx->frame_queue_mutex);
+    }
+
+    if (ctx->frame_queue_head) {
+        job = ctx->frame_queue_head;
+        ctx->frame_queue_head = job->next;
+        if (!ctx->frame_queue_head) {
+            ctx->frame_queue_tail = NULL;
+        }
+        job->next = NULL;
+        ctx->pending_jobs--;
+    }
+    pthread_mutex_unlock(&ctx->frame_queue_mutex);
+
+    return job;
+}
+
+static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *frame)
+{
+    struct netint_frame_job *job = bzalloc(sizeof(*job));
+    if (!job) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame job");
+        return false;
+    }
+
+    job->buffer_size = ctx->hw_frame_size;
+    job->pts = frame->pts;
+    job->end_of_stream = false;
+    job->start_of_stream = false;
+
+    if (ctx->hw_frame_size > 0) {
+        job->buffer = bmalloc(ctx->hw_frame_size);
+        if (!job->buffer) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte frame buffer", ctx->hw_frame_size);
+            netint_free_job(job);
+            return false;
+        }
+
+        uint8_t *dest_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
+        for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+            if (ctx->hw_plane_size[i] > 0) {
+                dest_planes[i] = job->buffer + ctx->hw_plane_offset[i];
+            }
+        }
+
+        uint8_t *src_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
+            frame->data[0],
+            frame->data[1],
+            frame->data[2],
+            NULL};
+
+        int src_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
+            frame->linesize[0],
+            frame->linesize[1],
+            frame->linesize[2],
+            0};
+
+        int src_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
+            ctx->enc.height,
+            ctx->enc.height / 2,
+            ctx->enc.height / 2,
+            0};
+
+        p_ni_logan_copy_hw_yuv420p(dest_planes,
+                                   src_planes,
+                                   ctx->enc.width,
+                                   ctx->enc.height,
+                                   1,
+                                   ctx->hw_stride,
+                                   ctx->hw_height,
+                                   src_stride,
+                                   src_height);
+    }
+
+    netint_enqueue_job(ctx, job, true);
+    return true;
+}
+
+static bool netint_queue_eos(struct netint_ctx *ctx)
+{
+    struct netint_frame_job *job = bzalloc(sizeof(*job));
+    if (!job) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate EOS job");
+        return false;
+    }
+
+    job->buffer = NULL;
+    job->buffer_size = 0;
+    job->pts = 0;
+    job->end_of_stream = true;
+    job->start_of_stream = false;
+
+    netint_enqueue_job(ctx, job, false);
+    return true;
+}
+
+static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job)
+{
     bool success = false;
+    bool allocated_buffer = false;
 
     pthread_mutex_lock(&ctx->io_mutex);
 
     int get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
     if (get_ret < 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_get_frame failed (ret=%d)", get_ret);
+        netint_log_error(ctx, "ni_logan_encode_get_frame", get_ret);
         goto done;
     }
 
@@ -1156,64 +1221,58 @@ static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *fram
     }
 
     ni_logan_frame_t *ni_frame = &input_fme->data.frame;
-
-    int dst_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
-    int dst_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
-    p_ni_logan_get_hw_yuv420p_dim(width, height, bit_depth_factor, is_h264,
-                                  dst_stride, dst_height);
-
     ni_frame->extra_data_len = 64;
 
-    int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(ni_frame, width, height,
-                                                           dst_stride, is_h264,
-                                                           ni_frame->extra_data_len,
-                                                           bit_depth_factor);
+    int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(
+        ni_frame,
+        ctx->enc.width,
+        ctx->enc.height,
+        ctx->hw_stride,
+        (ctx->codec_type == 0) ? 1 : 0,
+        ni_frame->extra_data_len,
+        1);
+
     if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame buffer (ret=%d)", alloc_ret);
+        netint_log_error(ctx, "ni_logan_encoder_frame_buffer_alloc", alloc_ret);
         goto done;
     }
     allocated_buffer = true;
 
-    if (!end_of_stream && frame) {
-        uint8_t *src_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
-            frame->data[0],
-            frame->data[1],
-            frame->data[2],
-            NULL};
-        int src_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
-            frame->linesize[0],
-            frame->linesize[1],
-            frame->linesize[2],
-            0};
-        int src_height[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {
-            height,
-            height / 2,
-            height / 2,
-            0};
-
-        p_ni_logan_copy_hw_yuv420p((uint8_t **)ni_frame->p_data, (uint8_t **)src_planes,
-                                    width, height, bit_depth_factor,
-                                    dst_stride, dst_height, src_stride, src_height);
+    if (!job->end_of_stream && job->buffer && ctx->hw_frame_size > 0) {
+        size_t offset = 0;
+        for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+            if (ctx->hw_plane_size[i] > 0 && ni_frame->p_data[i]) {
+                memcpy(ni_frame->p_data[i], job->buffer + offset, ctx->hw_plane_size[i]);
+                offset += ctx->hw_plane_size[i];
+            } else if (ni_frame->p_data[i] && ctx->hw_plane_size[i] == 0) {
+                /* Plane exists but empty - zero it */
+                size_t plane_stride = (size_t)ctx->hw_stride[i];
+                size_t plane_height = (size_t)ctx->hw_height[i];
+                if (plane_stride > 0 && plane_height > 0) {
+                    memset(ni_frame->p_data[i], 0, plane_stride * plane_height);
+                }
+            }
+        }
     } else if (allocated_buffer) {
         for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
-            if (ni_frame->p_data[i] && dst_stride[i] > 0 && dst_height[i] > 0) {
-                size_t plane_size = (size_t)dst_stride[i] * (size_t)dst_height[i];
-                memset(ni_frame->p_data[i], 0, plane_size);
+            if (ni_frame->p_data[i] && ctx->hw_plane_size[i] > 0) {
+                memset(ni_frame->p_data[i], 0, ctx->hw_plane_size[i]);
             }
         }
     }
 
-    ni_frame->video_width = width;
-    ni_frame->video_height = height;
-    ni_frame->video_orig_width = width;
-    ni_frame->video_orig_height = height;
-    ni_frame->pts = (frame && !end_of_stream) ? frame->pts : 0;
+    ni_frame->video_width = ctx->enc.width;
+    ni_frame->video_height = ctx->enc.height;
+    ni_frame->video_orig_width = ctx->enc.width;
+    ni_frame->video_orig_height = ctx->enc.height;
+    ni_frame->pts = job->end_of_stream ? 0 : job->pts;
     ni_frame->dts = ni_frame->pts;
-    ni_frame->start_of_stream = start_of_stream ? 1 : 0;
-    ni_frame->end_of_stream = end_of_stream ? 1 : 0;
-    ni_frame->force_key_frame = start_of_stream ? 1 : 0;
-    ni_frame->ni_logan_pict_type = start_of_stream ? LOGAN_PIC_TYPE_IDR : 0;
-    ni_frame->bit_depth = (uint16_t)bit_depth;
+    ni_frame->start_of_stream = job->start_of_stream ? 1 : 0;
+    ni_frame->end_of_stream = job->end_of_stream ? 1 : 0;
+    ni_frame->force_key_frame = job->start_of_stream ? 1 : 0;
+    ni_frame->ni_logan_pict_type = job->start_of_stream ? LOGAN_PIC_TYPE_IDR : 0;
+    ni_frame->bit_depth = 8;
     ni_frame->color_primaries = (uint8_t)ctx->enc.color_primaries;
     ni_frame->color_trc = (uint8_t)ctx->enc.color_trc;
     ni_frame->color_space = (uint8_t)ctx->enc.color_space;
@@ -1222,6 +1281,7 @@ static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *fram
     int send_ret = p_ni_logan_encode_send(&ctx->enc);
     if (send_ret < 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_send failed (ret=%d)", send_ret);
+        netint_log_error(ctx, "ni_logan_encode_send", send_ret);
         goto done;
     }
 
@@ -1230,10 +1290,11 @@ static bool netint_send_frame(struct netint_ctx *ctx, struct encoder_frame *fram
         blog(LOG_INFO, "[obs-netint-t4xx] Encoder marked as started (ni_logan_encode_send success)");
     }
 
-    if (!end_of_stream) {
+    if (!job->end_of_stream) {
         ctx->frame_count++;
     }
 
+    ctx->consecutive_errors = 0;
     success = true;
 
 done:
@@ -1244,43 +1305,175 @@ done:
     return success;
 }
 
-static bool netint_encode_batch(struct netint_ctx *ctx, struct encoder_packet *packet, bool *received)
+static bool netint_hw_receive_once(struct netint_ctx *ctx)
 {
-    UNUSED_PARAMETER(packet);
-    UNUSED_PARAMETER(received);
+    uint8_t *copied_data = NULL;
+    size_t copied_size = 0;
+    int64_t pkt_pts = 0;
+    int64_t pkt_dts = 0;
+    bool pkt_keyframe = false;
+    bool got_packet = false;
 
-    if (ctx->frame_buffer.count == 0) {
-        return true;
-    }
+    pthread_mutex_lock(&ctx->io_mutex);
+    int recv_size = p_ni_logan_encode_receive(&ctx->enc);
 
-    for (int i = 0; i < ctx->frame_buffer.count; i++) {
-        struct encoder_frame *frame = (struct encoder_frame *)ctx->frame_buffer.frames[i];
-        bool start_of_stream = (ctx->frame_count == 0 && i == 0);
+    if (recv_size > 0) {
+        ni_logan_packet_t *ni_pkt = &ctx->enc.output_pkt.data.packet;
+        int packet_size = recv_size;
+        if (ctx->enc.spsPpsAttach && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
+            packet_size += ctx->enc.spsPpsHdrLen;
+        }
 
-        if (!netint_send_frame(ctx, frame, start_of_stream, false)) {
+        copied_data = bmalloc((size_t)packet_size);
+        if (!copied_data) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] Failed to allocate packet buffer (%d bytes)", packet_size);
+            netint_log_error(ctx, "packet_buffer_alloc", -ENOMEM);
+        } else {
+            int first_packet_flag = ctx->enc.firstPktArrived ? 0 : 1;
+            int copy_ret = p_ni_logan_encode_copy_packet_data(&ctx->enc,
+                                                              copied_data,
+                                                              first_packet_flag,
+                                                              ctx->enc.spsPpsAttach);
+            if (copy_ret < 0) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] encode_copy_packet_data failed (ret=%d)", copy_ret);
+                netint_log_error(ctx, "ni_logan_encode_copy_packet_data", copy_ret);
+                bfree(copied_data);
+                copied_data = NULL;
+            } else {
+                copied_size = (size_t)packet_size;
+
+                if (!ctx->got_headers && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
+                    if (ctx->extra) bfree(ctx->extra);
+                    ctx->extra = bmemdup(ctx->enc.p_spsPpsHdr, (size_t)ctx->enc.spsPpsHdrLen);
+                    ctx->extra_size = (size_t)ctx->enc.spsPpsHdrLen;
+                    ctx->got_headers = true;
+                    blog(LOG_INFO, "[obs-netint-t4xx] [IO THREAD] Stored SPS/PPS extradata (%zu bytes)", ctx->extra_size);
+                }
+
+                pkt_pts = ni_pkt->pts;
+                pkt_dts = ni_pkt->dts;
+                if (pkt_pts == 0 && ctx->enc.latest_dts != 0) {
+                    pkt_pts = ctx->enc.latest_dts;
+                    pkt_dts = pkt_pts;
+                }
+
+                if (ctx->codec_type == 1) {
+                    pkt_keyframe = obs_hevc_keyframe(copied_data, copied_size);
+                } else {
+                    pkt_keyframe = obs_avc_keyframe(copied_data, copied_size);
+                }
+
+                ctx->enc.encoder_eof = ni_pkt->end_of_stream;
+                ctx->enc.firstPktArrived = 1;
+                got_packet = true;
+            }
+        }
+    } else if (recv_size < 0) {
+        if (ctx->enc.encoder_eof) {
+            pthread_mutex_unlock(&ctx->io_mutex);
             return false;
         }
     }
 
-    ctx->frame_buffer.count = 0;
-    return true;
-}
+    pthread_mutex_unlock(&ctx->io_mutex);
 
-static bool netint_encode_flush(struct netint_ctx *ctx, struct encoder_packet *packet, bool *received)
-{
-    if (ctx->flushing) {
-        *received = false;
-        return true;
-    }
-
-    if (!netint_send_eos_frame(ctx)) {
-        *received = false;
+    if (!got_packet || !copied_data) {
+        if (copied_data) bfree(copied_data);
         return false;
     }
 
-    ctx->flushing = true;
-    *received = false;
+    struct netint_pkt *pkt = bzalloc(sizeof(*pkt));
+    if (!pkt) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] Failed to allocate queue packet");
+        bfree(copied_data);
+        return false;
+    }
+
+    pkt->data = copied_data;
+    pkt->size = copied_size;
+    pkt->pts = pkt_pts;
+    pkt->dts = pkt_dts;
+    pkt->keyframe = pkt_keyframe;
+    pkt->priority = 0;
+
+    pthread_mutex_lock(&ctx->queue_mutex);
+    pkt->next = NULL;
+    if (ctx->pkt_queue_tail) {
+        ctx->pkt_queue_tail->next = pkt;
+        ctx->pkt_queue_tail = pkt;
+    } else {
+        ctx->pkt_queue_head = pkt;
+        ctx->pkt_queue_tail = pkt;
+    }
+    pthread_mutex_unlock(&ctx->queue_mutex);
+
+    pthread_mutex_lock(&ctx->frame_queue_mutex);
+    if (ctx->inflight_frames > 0) {
+        ctx->inflight_frames--;
+    }
+    pthread_mutex_unlock(&ctx->frame_queue_mutex);
+
+    ctx->consecutive_errors = 0;
     return true;
+}
+
+static void netint_hw_drain(struct netint_ctx *ctx, bool drain_all)
+{
+    int drained = 0;
+    while (netint_hw_receive_once(ctx)) {
+        drained++;
+        if (!drain_all && drained >= 1) {
+            break;
+        }
+    }
+}
+
+static void *netint_io_thread(void *data)
+{
+    struct netint_ctx *ctx = data;
+    blog(LOG_INFO, "[obs-netint-t4xx] IO thread started (pipelined send/receive)");
+
+    while (true) {
+        struct netint_frame_job *job = netint_dequeue_job(ctx, true);
+
+        if (!job) {
+            if (ctx->stop_thread) {
+                break;
+            }
+
+            netint_hw_drain(ctx, false);
+            continue;
+        }
+
+        if (!netint_hw_send_job(ctx, job)) {
+            netint_free_job(job);
+            continue;
+        }
+
+        if (!job->end_of_stream) {
+            pthread_mutex_lock(&ctx->frame_queue_mutex);
+            ctx->inflight_frames++;
+            pthread_mutex_unlock(&ctx->frame_queue_mutex);
+        }
+
+        netint_free_job(job);
+
+        pthread_mutex_lock(&ctx->frame_queue_mutex);
+        int inflight = ctx->inflight_frames;
+        pthread_mutex_unlock(&ctx->frame_queue_mutex);
+
+        if (ctx->max_inflight > 0 && inflight >= ctx->max_inflight) {
+            netint_hw_drain(ctx, true);
+        } else {
+            netint_hw_drain(ctx, false);
+        }
+    }
+
+    /* Final drain to ensure packets (including EOS) are delivered */
+    netint_hw_drain(ctx, true);
+
+    blog(LOG_INFO, "[obs-netint-t4xx] IO thread exiting");
+    return NULL;
 }
 
 static bool netint_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet, bool *received)
@@ -1288,42 +1481,21 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     struct netint_ctx *ctx = data;
     *received = false;
 
-    /* DEBUG: Log every call to netint_encode to see if OBS is calling us */
-    static int call_count = 0;
-    call_count++;
-    blog(LOG_INFO, "[obs-netint-t4xx] ▶ netint_encode() call #%d: frame=%p", call_count, frame);
-
-    /* DEBUG: Check encoder state */
-    blog(LOG_INFO, "[obs-netint-t4xx] Encoder state: started=%d, p_input_fme=%p",
-         ctx->enc.started, ctx->enc.p_input_fme);
-
 #ifdef DEBUG_NETINT_PLUGIN
-    /* Validate magic number to detect corruption */
     if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
-        blog(LOG_ERROR, "[DEBUG] Invalid context magic in netint_encode: 0x%08X (expected 0x%08X)", 
+        blog(LOG_ERROR, "[DEBUG] Invalid context magic in netint_encode: 0x%08X (expected 0x%08X)",
              ctx->debug_magic, NETINT_ENC_CONTEXT_MAGIC);
         NETINT_DEBUGBREAK();
         return false;
     }
 #endif
 
-    /* Validate context */
     NETINT_VALIDATE_ENC_CONTEXT(ctx, "netint_encode entry");
 
-    /* ===================================================================
-     * STEP 1: ALWAYS check for available packets FIRST
-     * ===================================================================
-     *
-     * Critical: Check for packets BEFORE sending frames. The encoder may have
-     * buffered frames and produced packets that need to be returned immediately.
-     * This matches the xcoder_logan pattern: receive -> send -> receive -> send...
-     */
-
-    /* Fallback: Try to get any queued packets from background thread */
+    /* Check for packets produced by IO thread */
     pthread_mutex_lock(&ctx->queue_mutex);
     struct netint_pkt *pkt = ctx->pkt_queue_head;
     if (pkt) {
-        /* Remove from queue */
         ctx->pkt_queue_head = pkt->next;
         if (!ctx->pkt_queue_head) {
             ctx->pkt_queue_tail = NULL;
@@ -1331,11 +1503,7 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     }
     pthread_mutex_unlock(&ctx->queue_mutex);
 
-    /* If we have a packet, return it to OBS */
     if (pkt) {
-        blog(LOG_INFO, "[obs-netint-t4xx] ✅ Returning queued packet: size=%zu, pts=%lld, keyframe=%d",
-             pkt->size, (long long)pkt->pts, pkt->keyframe);
-
         packet->data = pkt->data;
         packet->size = pkt->size;
         packet->pts = pkt->pts;
@@ -1343,61 +1511,41 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
         packet->keyframe = pkt->keyframe;
         packet->type = OBS_ENCODER_VIDEO;
 
-        /* Get timebase */
         video_t *video = obs_encoder_video(ctx->encoder);
         const struct video_output_info *voi = video_output_get_info(video);
         packet->timebase_num = (int32_t)voi->fps_den;
         packet->timebase_den = (int32_t)voi->fps_num;
 
-        /* Parse packet for priority */
         if (ctx->codec_type == 1) {
             packet->priority = obs_parse_hevc_packet_priority(packet);
         } else {
             packet->priority = obs_parse_avc_packet_priority(packet);
         }
 
-        /* Encoder busy flag already cleared by netint_encode_batch */
-
-        /* Free packet struct (but NOT data - OBS owns it now!) */
         bfree(pkt);
-
         *received = true;
-        blog(LOG_INFO, "[obs-netint-t4xx] ✅ Packet returned to OBS: %zu bytes", packet->size);
         return true;
     }
 
-    /* ===================================================================
-     * STEP 2: Buffer incoming frame for batch processing (like xcoder_logan)
-     * ===================================================================
-     */
-
     if (!frame) {
         if (!ctx->flushing) {
-            blog(LOG_INFO, "[obs-netint-t4xx] Flushing encoder - no more frames");
-            return netint_encode_flush(ctx, packet, received);
+            blog(LOG_INFO, "[obs-netint-t4xx] Queueing EOS frame");
+            if (!netint_queue_eos(ctx)) {
+                return false;
+            }
+            ctx->flushing = true;
         }
 
         *received = false;
         return true;
     }
 
-    /* Buffer the incoming frame */
-    if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
-        /* Add frame to buffer */
-        ctx->frame_buffer.frames[ctx->frame_buffer.count] = (void *)frame;
-        ctx->frame_buffer.count++;
-        blog(LOG_INFO, "[obs-netint-t4xx] Buffered frame %d/%d", ctx->frame_buffer.count, ctx->frame_buffer.capacity);
-
-        /* If buffer not full yet, tell OBS we don't have a packet ready */
-        if (ctx->frame_buffer.count < ctx->frame_buffer.capacity) {
-            *received = false;
-            return true;
-        }
+    if (!netint_queue_frame(ctx, frame)) {
+        return false;
     }
 
-    /* Buffer is full - process the batch */
-    blog(LOG_INFO, "[obs-netint-t4xx] Frame buffer full (%d frames), processing batch like xcoder_logan", ctx->frame_buffer.count);
-    return netint_encode_batch(ctx, packet, received);
+    *received = false;
+    return true;
 }
 /**
  * @brief Set default settings for H.264 encoder
