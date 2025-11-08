@@ -1490,15 +1490,37 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
             ctx->enc.height / 2,
             0};
 
-        p_ni_logan_copy_hw_yuv420p(dest_planes,
-                                   src_planes,
-                                   ctx->enc.width,
-                                   ctx->enc.height,
-                                   1,
-                                   ctx->hw_stride,
-                                   ctx->hw_height,
-                                   src_stride,
-                                   src_height);
+        bool can_bulk_copy = true;
+        for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+            if (ctx->hw_plane_size[i] == 0)
+                continue;
+            if (!src_planes[i] || !dest_planes[i]) {
+                can_bulk_copy = false;
+                break;
+            }
+            if (src_stride[i] != ctx->hw_stride[i]) {
+                can_bulk_copy = false;
+                break;
+            }
+        }
+
+        if (can_bulk_copy) {
+            for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+                if (ctx->hw_plane_size[i] == 0)
+                    continue;
+                memcpy(dest_planes[i], src_planes[i], ctx->hw_plane_size[i]);
+            }
+        } else {
+            p_ni_logan_copy_hw_yuv420p(dest_planes,
+                                       src_planes,
+                                       ctx->enc.width,
+                                       ctx->enc.height,
+                                       1,
+                                       ctx->hw_stride,
+                                       ctx->hw_height,
+                                       src_stride,
+                                       src_height);
+        }
     }
 
     netint_enqueue_job(ctx, job, true);
