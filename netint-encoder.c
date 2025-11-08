@@ -77,9 +77,11 @@ struct netint_pkt {
 struct netint_frame_job {
     uint8_t *buffer;                  /**< Host copy of frame data laid out in HW format */
     size_t buffer_size;               /**< Size of the buffer in bytes */
+    size_t buffer_capacity;           /**< Total capacity of allocated buffer */
     int64_t pts;                      /**< Presentation/Decode timestamp */
     bool start_of_stream;             /**< Marks first frame to hardware */
     bool end_of_stream;               /**< Signals EOS to hardware */
+    bool from_pool;                   /**< Indicates job originated from reusable pool */
     struct netint_frame_job *next;    /**< Next job in queue */
 };
 
@@ -114,6 +116,11 @@ struct netint_frame_job {
  * After this many recovery attempts, we stop trying to recover and mark encoder as failed.
  */
 #define MAX_RECOVERY_ATTEMPTS 3
+
+/**
+ * @brief Minimum number of reusable frame jobs to keep in the pool
+ */
+#define NETINT_JOB_POOL_MIN_CAPACITY 6
 
 /**
  * @brief Encoder context structure - stores all state for a single encoder instance
@@ -168,6 +175,13 @@ struct netint_ctx {
     int inflight_frames;              /**< Count of frames submitted to HW but not yet drained */
     int max_inflight;                 /**< Maximum frames to keep in-flight before draining */
     uint64_t frames_submitted;        /**< Total frames enqueued (for start-of-stream decisions) */
+
+    /* Reusable frame job pool */
+    pthread_mutex_t job_pool_mutex;   /**< Protects reusable frame job pool */
+    bool job_pool_mutex_initialized;
+    struct netint_frame_job *job_pool_head; /**< Singly-linked list of available jobs */
+    int job_pool_size;                /**< Current number of jobs in pool */
+    int job_pool_capacity;            /**< Maximum number of jobs preallocated */
 
     /* Precomputed hardware frame layout */
     int hw_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS];
@@ -231,7 +245,10 @@ static void netint_destroy(void *data);
 static void *netint_io_thread(void *data);
 static void netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame);
 static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool wait_for_job);
-static void netint_free_job(struct netint_frame_job *job);
+static void netint_destroy_job_pool(struct netint_ctx *ctx);
+static bool netint_init_job_pool(struct netint_ctx *ctx);
+static struct netint_frame_job *netint_acquire_job(struct netint_ctx *ctx, bool require_buffer);
+static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *job);
 static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *frame);
 static bool netint_queue_eos(struct netint_ctx *ctx);
 static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job);
@@ -497,6 +514,11 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     }
 
     ctx->max_inflight = 4; /* Allow up to 4 frames queued in hardware before draining */
+
+    if (!netint_init_job_pool(ctx)) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame job pool");
+        goto fail;
+    }
     
     /* Initialize color space parameters (required by library) */
     ctx->enc.color_primaries = 2;  /* NI_COL_PRI_UNSPECIFIED */
@@ -1046,9 +1068,11 @@ static void netint_destroy(void *data)
     if (ctx->frame_queue_mutex_initialized) {
         struct netint_frame_job *pending_job = NULL;
         while ((pending_job = netint_dequeue_job(ctx, false)) != NULL) {
-            netint_free_job(pending_job);
+            netint_release_job(ctx, pending_job);
         }
     }
+
+    netint_destroy_job_pool(ctx);
     
     /* Free all queued packets */
     struct netint_pkt *pkt = ctx->pkt_queue_head;
@@ -1177,14 +1201,196 @@ static void netint_get_video_info(void *data, struct video_scale_info *info)
     UNUSED_PARAMETER(data);
     info->format = VIDEO_FORMAT_I420;
 }
-static void netint_free_job(struct netint_frame_job *job)
+static void netint_destroy_job_pool(struct netint_ctx *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    struct netint_frame_job *head = NULL;
+
+    if (ctx->job_pool_mutex_initialized) {
+        pthread_mutex_lock(&ctx->job_pool_mutex);
+        head = ctx->job_pool_head;
+        ctx->job_pool_head = NULL;
+        ctx->job_pool_size = 0;
+        pthread_mutex_unlock(&ctx->job_pool_mutex);
+
+        pthread_mutex_destroy(&ctx->job_pool_mutex);
+        ctx->job_pool_mutex_initialized = false;
+    } else {
+        head = ctx->job_pool_head;
+        ctx->job_pool_head = NULL;
+        ctx->job_pool_size = 0;
+    }
+
+    while (head) {
+        struct netint_frame_job *next = head->next;
+        if (head->buffer) {
+            bfree(head->buffer);
+        }
+        bfree(head);
+        head = next;
+    }
+
+    ctx->job_pool_capacity = 0;
+}
+
+static bool netint_init_job_pool(struct netint_ctx *ctx)
+{
+    if (!ctx) {
+        return false;
+    }
+
+    ctx->job_pool_capacity = ctx->max_inflight * 2;
+    if (ctx->job_pool_capacity < NETINT_JOB_POOL_MIN_CAPACITY) {
+        ctx->job_pool_capacity = NETINT_JOB_POOL_MIN_CAPACITY;
+    }
+
+    if (pthread_mutex_init(&ctx->job_pool_mutex, NULL) != 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize job pool mutex");
+        ctx->job_pool_mutex_initialized = false;
+        return false;
+    }
+
+    ctx->job_pool_mutex_initialized = true;
+    ctx->job_pool_head = NULL;
+    ctx->job_pool_size = 0;
+
+    for (int i = 0; i < ctx->job_pool_capacity; i++) {
+        struct netint_frame_job *job = bzalloc(sizeof(*job));
+        if (!job) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame job for pool");
+            netint_destroy_job_pool(ctx);
+            return false;
+        }
+
+        job->from_pool = true;
+        job->buffer_capacity = ctx->hw_frame_size;
+        job->buffer_size = ctx->hw_frame_size;
+
+        if (ctx->hw_frame_size > 0) {
+            job->buffer = bmalloc(ctx->hw_frame_size);
+            if (!job->buffer) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte buffer for job pool entry",
+                     ctx->hw_frame_size);
+                bfree(job);
+                netint_destroy_job_pool(ctx);
+                return false;
+            }
+        } else {
+            job->buffer = NULL;
+        }
+
+        job->next = ctx->job_pool_head;
+        ctx->job_pool_head = job;
+        ctx->job_pool_size++;
+    }
+
+    blog(LOG_INFO, "[obs-netint-t4xx] Initialized frame job pool (capacity=%d, frame_size=%zu)",
+         ctx->job_pool_capacity, ctx->hw_frame_size);
+    return true;
+}
+
+static struct netint_frame_job *netint_acquire_job(struct netint_ctx *ctx, bool require_buffer)
+{
+    struct netint_frame_job *job = NULL;
+
+    if (ctx->job_pool_mutex_initialized) {
+        pthread_mutex_lock(&ctx->job_pool_mutex);
+        if (ctx->job_pool_head) {
+            job = ctx->job_pool_head;
+            ctx->job_pool_head = job->next;
+            ctx->job_pool_size--;
+        }
+        pthread_mutex_unlock(&ctx->job_pool_mutex);
+    }
+
+    if (job) {
+        job->next = NULL;
+        job->buffer_size = ctx->hw_frame_size;
+        job->from_pool = true;
+
+        if (require_buffer && ctx->hw_frame_size > 0) {
+            if (job->buffer_capacity < ctx->hw_frame_size) {
+                uint8_t *new_buffer = (uint8_t *)brealloc(job->buffer, ctx->hw_frame_size);
+                if (!new_buffer) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to grow pooled frame buffer to %zu bytes",
+                         ctx->hw_frame_size);
+                    job->next = NULL;
+                    job->buffer_size = job->buffer_capacity;
+                    netint_release_job(ctx, job);
+                    return NULL;
+                }
+                job->buffer = new_buffer;
+                job->buffer_capacity = ctx->hw_frame_size;
+            }
+            if (!job->buffer) {
+                job->buffer = bmalloc(ctx->hw_frame_size);
+                if (!job->buffer) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate pooled frame buffer (%zu bytes)",
+                         ctx->hw_frame_size);
+                    netint_release_job(ctx, job);
+                    return NULL;
+                }
+                job->buffer_capacity = ctx->hw_frame_size;
+            }
+        }
+
+        return job;
+    }
+
+    job = bzalloc(sizeof(*job));
+    if (!job) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame job (pool empty)");
+        return NULL;
+    }
+
+    job->from_pool = false;
+    job->buffer_capacity = ctx->hw_frame_size;
+    job->buffer_size = ctx->hw_frame_size;
+
+    if (require_buffer && ctx->hw_frame_size > 0) {
+        job->buffer = bmalloc(ctx->hw_frame_size);
+        if (!job->buffer) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte frame buffer (pool empty)",
+                 ctx->hw_frame_size);
+            bfree(job);
+            return NULL;
+        }
+    }
+
+    return job;
+}
+
+static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *job)
 {
     if (!job) {
         return;
     }
 
+    if (job->from_pool && ctx->job_pool_mutex_initialized) {
+        job->pts = 0;
+        job->start_of_stream = false;
+        job->end_of_stream = false;
+        job->buffer_size = ctx->hw_frame_size;
+        job->next = NULL;
+
+        pthread_mutex_lock(&ctx->job_pool_mutex);
+        if (ctx->job_pool_size < ctx->job_pool_capacity) {
+            job->next = ctx->job_pool_head;
+            ctx->job_pool_head = job;
+            ctx->job_pool_size++;
+            pthread_mutex_unlock(&ctx->job_pool_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&ctx->job_pool_mutex);
+        /* Pool full - fall through to free */
+    }
+
     if (job->buffer) {
         bfree(job->buffer);
+        job->buffer = NULL;
     }
 
     bfree(job);
@@ -1242,9 +1448,9 @@ static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool 
 
 static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *frame)
 {
-    struct netint_frame_job *job = bzalloc(sizeof(*job));
+    struct netint_frame_job *job = netint_acquire_job(ctx, true);
     if (!job) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame job");
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to acquire frame job");
         return false;
     }
 
@@ -1254,13 +1460,11 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
     job->start_of_stream = false;
 
     if (ctx->hw_frame_size > 0) {
-        job->buffer = bmalloc(ctx->hw_frame_size);
         if (!job->buffer) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte frame buffer", ctx->hw_frame_size);
-            netint_free_job(job);
+            blog(LOG_ERROR, "[obs-netint-t4xx] Frame job missing buffer (%zu bytes expected)", ctx->hw_frame_size);
+            netint_release_job(ctx, job);
             return false;
         }
-
         uint8_t *dest_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
         for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
             if (ctx->hw_plane_size[i] > 0) {
@@ -1303,13 +1507,15 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
 
 static bool netint_queue_eos(struct netint_ctx *ctx)
 {
-    struct netint_frame_job *job = bzalloc(sizeof(*job));
+    struct netint_frame_job *job = netint_acquire_job(ctx, false);
     if (!job) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate EOS job");
-        return false;
+        job = bzalloc(sizeof(*job));
+        if (!job) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate EOS job");
+            return false;
+        }
     }
 
-    job->buffer = NULL;
     job->buffer_size = 0;
     job->pts = 0;
     job->end_of_stream = true;
@@ -1566,7 +1772,7 @@ static void *netint_io_thread(void *data)
         }
 
         if (!netint_hw_send_job(ctx, job)) {
-            netint_free_job(job);
+            netint_release_job(ctx, job);
             continue;
         }
 
@@ -1576,7 +1782,7 @@ static void *netint_io_thread(void *data)
             pthread_mutex_unlock(&ctx->frame_queue_mutex);
         }
 
-        netint_free_job(job);
+        netint_release_job(ctx, job);
 
         pthread_mutex_lock(&ctx->frame_queue_mutex);
         int inflight = ctx->inflight_frames;
