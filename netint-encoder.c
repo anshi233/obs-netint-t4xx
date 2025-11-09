@@ -1338,9 +1338,8 @@ static struct netint_pkt *netint_acquire_packet(struct netint_ctx *ctx, size_t r
 
 static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt)
 {
-    if (!ctx || !pkt) {
+    if (!ctx || !pkt)
         return;
-    }
 
     if (ctx->queue_mutex_initialized) {
         pthread_mutex_lock(&ctx->queue_mutex);
@@ -1353,9 +1352,8 @@ static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt
 
 static void netint_release_packet_locked(struct netint_ctx *ctx, struct netint_pkt *pkt)
 {
-    if (!ctx || !pkt) {
+    if (!ctx || !pkt)
         return;
-    }
 
     pkt->size = 0;
     pkt->pts = 0;
@@ -1773,25 +1771,36 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
     }
     allocated_buffer = true;
 
-    if (!job->end_of_stream && job->buffer && ctx->hw_frame_size > 0) {
-        size_t offset = 0;
+    if (ctx->hw_frame_size > 0 && ni_frame->p_data[0]) {
+        bool planes_contiguous = true;
+        size_t expected_offset = 0;
+        uint8_t *base_ptr = (uint8_t *)ni_frame->p_data[0];
         for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
-            if (ctx->hw_plane_size[i] > 0 && ni_frame->p_data[i]) {
-                memcpy(ni_frame->p_data[i], job->buffer + offset, ctx->hw_plane_size[i]);
-                offset += ctx->hw_plane_size[i];
-            } else if (ni_frame->p_data[i] && ctx->hw_plane_size[i] == 0) {
-                /* Plane exists but empty - zero it */
-                size_t plane_stride = (size_t)ctx->hw_stride[i];
-                size_t plane_height = (size_t)ctx->hw_height[i];
-                if (plane_stride > 0 && plane_height > 0) {
-                    memset(ni_frame->p_data[i], 0, plane_stride * plane_height);
-                }
+            if (ctx->hw_plane_size[i] == 0)
+                continue;
+
+            if (!ni_frame->p_data[i] ||
+                (uint8_t *)ni_frame->p_data[i] != base_ptr + expected_offset) {
+                planes_contiguous = false;
+                break;
             }
+
+            expected_offset += ctx->hw_plane_size[i];
         }
-    } else if (allocated_buffer) {
-        for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
-            if (ni_frame->p_data[i] && ctx->hw_plane_size[i] > 0) {
-                memset(ni_frame->p_data[i], 0, ctx->hw_plane_size[i]);
+        planes_contiguous = planes_contiguous && expected_offset == ctx->hw_frame_size;
+
+        if (!job->end_of_stream && job->buffer) {
+            if (planes_contiguous) {
+                memcpy(base_ptr, job->buffer, ctx->hw_frame_size);
+            } else {
+                size_t offset = 0;
+                for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+                    if (ctx->hw_plane_size[i] > 0 && ni_frame->p_data[i]) {
+                        memcpy((uint8_t *)ni_frame->p_data[i], job->buffer + offset,
+                               ctx->hw_plane_size[i]);
+                        offset += ctx->hw_plane_size[i];
+                    }
+                }
             }
         }
     }
@@ -1873,32 +1882,39 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
                 netint_release_packet(ctx, pkt);
                 pkt = NULL;
             } else {
-                pkt->size = (size_t)packet_size;
-
-                if (!ctx->got_headers && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
-                    if (ctx->extra) bfree(ctx->extra);
-                    ctx->extra = bmemdup(ctx->enc.p_spsPpsHdr, (size_t)ctx->enc.spsPpsHdrLen);
-                    ctx->extra_size = (size_t)ctx->enc.spsPpsHdrLen;
-                    ctx->got_headers = true;
-                    blog(LOG_INFO, "[obs-netint-t4xx] [IO THREAD] Stored SPS/PPS extradata (%zu bytes)", ctx->extra_size);
-                }
-
-                pkt_pts = ni_pkt->pts;
-                pkt_dts = ni_pkt->dts;
-                if (pkt_pts == 0 && ctx->enc.latest_dts != 0) {
-                    pkt_pts = ctx->enc.latest_dts;
-                    pkt_dts = pkt_pts;
-                }
-
-                if (ctx->codec_type == 1) {
-                    pkt_keyframe = obs_hevc_keyframe(pkt->data, pkt->size);
+                if (packet_size > pkt->capacity) {
+                    blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] Packet size (%d) exceeds buffer capacity (%zu)",
+                         packet_size, pkt->capacity);
+                    netint_release_packet(ctx, pkt);
+                    pkt = NULL;
                 } else {
-                    pkt_keyframe = obs_avc_keyframe(pkt->data, pkt->size);
-                }
+                    pkt->size = (size_t)packet_size;
 
-                ctx->enc.encoder_eof = ni_pkt->end_of_stream;
-                ctx->enc.firstPktArrived = 1;
-                got_packet = true;
+                    if (!ctx->got_headers && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
+                        if (ctx->extra) bfree(ctx->extra);
+                        ctx->extra = bmemdup(ctx->enc.p_spsPpsHdr, (size_t)ctx->enc.spsPpsHdrLen);
+                        ctx->extra_size = (size_t)ctx->enc.spsPpsHdrLen;
+                        ctx->got_headers = true;
+                        blog(LOG_INFO, "[obs-netint-t4xx] [IO THREAD] Stored SPS/PPS extradata (%zu bytes)", ctx->extra_size);
+                    }
+
+                    pkt_pts = ni_pkt->pts;
+                    pkt_dts = ni_pkt->dts;
+                    if (pkt_pts == 0 && ctx->enc.latest_dts != 0) {
+                        pkt_pts = ctx->enc.latest_dts;
+                        pkt_dts = pkt_pts;
+                    }
+
+                    if (ctx->codec_type == 1) {
+                        pkt_keyframe = obs_hevc_keyframe(pkt->data, pkt->size);
+                    } else {
+                        pkt_keyframe = obs_avc_keyframe(pkt->data, pkt->size);
+                    }
+
+                    ctx->enc.encoder_eof = ni_pkt->end_of_stream;
+                    ctx->enc.firstPktArrived = 1;
+                    got_packet = true;
+                }
             }
         }
     } else if (recv_size < 0) {
