@@ -67,6 +67,7 @@
 struct netint_pkt {
     uint8_t *data;        /**< Encoded packet data (allocated, must be freed) */
     size_t size;          /**< Size of encoded packet in bytes */
+    size_t capacity;      /**< Total capacity of data buffer */
     int64_t pts;          /**< Presentation timestamp (when frame should be displayed) */
     int64_t dts;          /**< Decode timestamp (when frame should be decoded) */
     bool keyframe;        /**< true if this is a keyframe (I-frame), false for P/B frames */
@@ -123,6 +124,11 @@ struct netint_frame_job {
 #define NETINT_JOB_POOL_MIN_CAPACITY 6
 
 /**
+ * @brief Minimum number of reusable packet buffers to keep in the pool
+ */
+#define NETINT_PKT_POOL_MIN_CAPACITY 8
+
+/**
  * @brief Encoder context structure - stores all state for a single encoder instance
  * 
  * This structure contains all the state needed for one encoder instance:
@@ -168,6 +174,12 @@ struct netint_ctx {
     bool thread_created;              /**< true if io_thread was successfully created */
     struct netint_pkt *pkt_queue_head; /**< Head of packet queue (oldest packet) */
     struct netint_pkt *pkt_queue_tail; /**< Tail of packet queue (newest packet) */
+    struct netint_pkt *pkt_pool_head;  /**< Pool of reusable packet buffers */
+    struct netint_pkt *last_delivered_pkt; /**< Packet most recently delivered to OBS */
+    int pkt_pool_size;                 /**< Current number of packets in pool */
+    int pkt_pool_capacity;             /**< Maximum packets retained in pool */
+    pthread_mutex_t pkt_pool_mutex;    /**< Protects packet pool access */
+    bool pkt_pool_mutex_initialized;
 
     struct netint_frame_job *frame_queue_head; /**< Pending frame jobs (host buffers ready for send) */
     struct netint_frame_job *frame_queue_tail;
@@ -249,6 +261,11 @@ static void netint_destroy_job_pool(struct netint_ctx *ctx);
 static bool netint_init_job_pool(struct netint_ctx *ctx);
 static struct netint_frame_job *netint_acquire_job(struct netint_ctx *ctx, bool require_buffer);
 static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *job);
+static struct netint_pkt *netint_acquire_packet(struct netint_ctx *ctx, size_t required_size);
+static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt);
+static void netint_destroy_packet_pool(struct netint_ctx *ctx);
+static bool netint_init_packet_pool(struct netint_ctx *ctx);
+static void netint_free_packet(struct netint_pkt *pkt);
 static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *frame);
 static bool netint_queue_eos(struct netint_ctx *ctx);
 static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job);
@@ -514,6 +531,11 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     }
 
     ctx->max_inflight = 4; /* Allow up to 4 frames queued in hardware before draining */
+
+    if (!netint_init_packet_pool(ctx)) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize packet pool");
+        goto fail;
+    }
 
     if (!netint_init_job_pool(ctx)) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame job pool");
@@ -1075,15 +1097,21 @@ static void netint_destroy(void *data)
     netint_destroy_job_pool(ctx);
     
     /* Free all queued packets */
+    if (ctx->last_delivered_pkt) {
+        netint_free_packet(ctx->last_delivered_pkt);
+        ctx->last_delivered_pkt = NULL;
+    }
+
     struct netint_pkt *pkt = ctx->pkt_queue_head;
     while (pkt) {
         struct netint_pkt *next = pkt->next;
-        if (pkt->data) bfree(pkt->data);
-        bfree(pkt);
+        netint_free_packet(pkt);
         pkt = next;
     }
     ctx->pkt_queue_head = NULL;
     ctx->pkt_queue_tail = NULL;
+
+    netint_destroy_packet_pool(ctx);
     
     /* Destroy mutexes LAST (after thread is stopped!) */
     if (ctx->frame_queue_cond_initialized) {
@@ -1201,6 +1229,154 @@ static void netint_get_video_info(void *data, struct video_scale_info *info)
     UNUSED_PARAMETER(data);
     info->format = VIDEO_FORMAT_I420;
 }
+
+static void netint_free_packet(struct netint_pkt *pkt)
+{
+    if (!pkt) {
+        return;
+    }
+
+    if (pkt->data) {
+        bfree(pkt->data);
+        pkt->data = NULL;
+    }
+
+    pkt->capacity = 0;
+    pkt->size = 0;
+    bfree(pkt);
+}
+
+static bool netint_init_packet_pool(struct netint_ctx *ctx)
+{
+    if (!ctx) {
+        return false;
+    }
+
+    ctx->pkt_pool_head = NULL;
+    ctx->pkt_pool_size = 0;
+    ctx->pkt_pool_capacity = MAX_PKT_QUEUE_SIZE * 2;
+    if (ctx->pkt_pool_capacity < NETINT_PKT_POOL_MIN_CAPACITY) {
+        ctx->pkt_pool_capacity = NETINT_PKT_POOL_MIN_CAPACITY;
+    }
+    ctx->last_delivered_pkt = NULL;
+
+    if (pthread_mutex_init(&ctx->pkt_pool_mutex, NULL) != 0) {
+        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize packet pool mutex");
+        ctx->pkt_pool_mutex_initialized = false;
+        return false;
+    }
+
+    ctx->pkt_pool_mutex_initialized = true;
+    return true;
+}
+
+static void netint_destroy_packet_pool(struct netint_ctx *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    struct netint_pkt *head = NULL;
+
+    if (ctx->pkt_pool_mutex_initialized) {
+        pthread_mutex_lock(&ctx->pkt_pool_mutex);
+        head = ctx->pkt_pool_head;
+        ctx->pkt_pool_head = NULL;
+        ctx->pkt_pool_size = 0;
+        pthread_mutex_unlock(&ctx->pkt_pool_mutex);
+
+        pthread_mutex_destroy(&ctx->pkt_pool_mutex);
+        ctx->pkt_pool_mutex_initialized = false;
+    } else {
+        head = ctx->pkt_pool_head;
+        ctx->pkt_pool_head = NULL;
+        ctx->pkt_pool_size = 0;
+    }
+
+    while (head) {
+        struct netint_pkt *next = head->next;
+        netint_free_packet(head);
+        head = next;
+    }
+
+    ctx->pkt_pool_capacity = 0;
+}
+
+static struct netint_pkt *netint_acquire_packet(struct netint_ctx *ctx, size_t required_size)
+{
+    if (!ctx) {
+        return NULL;
+    }
+
+    struct netint_pkt *pkt = NULL;
+
+    if (ctx->pkt_pool_mutex_initialized) {
+        pthread_mutex_lock(&ctx->pkt_pool_mutex);
+        if (ctx->pkt_pool_head) {
+            pkt = ctx->pkt_pool_head;
+            ctx->pkt_pool_head = pkt->next;
+            ctx->pkt_pool_size--;
+        }
+        pthread_mutex_unlock(&ctx->pkt_pool_mutex);
+    }
+
+    if (!pkt) {
+        pkt = bzalloc(sizeof(*pkt));
+        if (!pkt) {
+            return NULL;
+        }
+    }
+
+    if (required_size == 0) {
+        required_size = 1;
+    }
+
+    if (pkt->capacity < required_size) {
+        uint8_t *new_buffer = pkt->data ? (uint8_t *)brealloc(pkt->data, required_size)
+                                        : (uint8_t *)bmalloc(required_size);
+        if (!new_buffer) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte packet buffer", required_size);
+            netint_free_packet(pkt);
+            return NULL;
+        }
+
+        pkt->data = new_buffer;
+        pkt->capacity = required_size;
+    }
+
+    pkt->size = 0;
+    pkt->next = NULL;
+    return pkt;
+}
+
+static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt)
+{
+    if (!ctx || !pkt) {
+        return;
+    }
+
+    pkt->size = 0;
+    pkt->pts = 0;
+    pkt->dts = 0;
+    pkt->keyframe = false;
+    pkt->priority = 0;
+    pkt->next = NULL;
+
+    if (ctx->pkt_pool_mutex_initialized) {
+        pthread_mutex_lock(&ctx->pkt_pool_mutex);
+        if (ctx->pkt_pool_size < ctx->pkt_pool_capacity) {
+            pkt->next = ctx->pkt_pool_head;
+            ctx->pkt_pool_head = pkt;
+            ctx->pkt_pool_size++;
+            pthread_mutex_unlock(&ctx->pkt_pool_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&ctx->pkt_pool_mutex);
+    }
+
+    netint_free_packet(pkt);
+}
+
 static void netint_destroy_job_pool(struct netint_ctx *ctx)
 {
     if (!ctx) {
@@ -1670,8 +1846,7 @@ done:
 
 static bool netint_hw_receive_once(struct netint_ctx *ctx)
 {
-    uint8_t *copied_data = NULL;
-    size_t copied_size = 0;
+    struct netint_pkt *pkt = NULL;
     int64_t pkt_pts = 0;
     int64_t pkt_dts = 0;
     bool pkt_keyframe = false;
@@ -1687,23 +1862,22 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
             packet_size += ctx->enc.spsPpsHdrLen;
         }
 
-        copied_data = bmalloc((size_t)packet_size);
-        if (!copied_data) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] Failed to allocate packet buffer (%d bytes)", packet_size);
+        pkt = netint_acquire_packet(ctx, (size_t)packet_size);
+        if (!pkt) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] Failed to acquire reusable packet buffer (%d bytes)",
+                 packet_size);
             netint_log_error(ctx, "packet_buffer_alloc", -ENOMEM);
         } else {
             int first_packet_flag = ctx->enc.firstPktArrived ? 0 : 1;
-            int copy_ret = p_ni_logan_encode_copy_packet_data(&ctx->enc,
-                                                              copied_data,
-                                                              first_packet_flag,
+            int copy_ret = p_ni_logan_encode_copy_packet_data(&ctx->enc, pkt->data, first_packet_flag,
                                                               ctx->enc.spsPpsAttach);
             if (copy_ret < 0) {
                 blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] encode_copy_packet_data failed (ret=%d)", copy_ret);
                 netint_log_error(ctx, "ni_logan_encode_copy_packet_data", copy_ret);
-                bfree(copied_data);
-                copied_data = NULL;
+                netint_release_packet(ctx, pkt);
+                pkt = NULL;
             } else {
-                copied_size = (size_t)packet_size;
+                pkt->size = (size_t)packet_size;
 
                 if (!ctx->got_headers && ctx->enc.p_spsPpsHdr && ctx->enc.spsPpsHdrLen > 0) {
                     if (ctx->extra) bfree(ctx->extra);
@@ -1721,9 +1895,9 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
                 }
 
                 if (ctx->codec_type == 1) {
-                    pkt_keyframe = obs_hevc_keyframe(copied_data, copied_size);
+                    pkt_keyframe = obs_hevc_keyframe(pkt->data, pkt->size);
                 } else {
-                    pkt_keyframe = obs_avc_keyframe(copied_data, copied_size);
+                    pkt_keyframe = obs_avc_keyframe(pkt->data, pkt->size);
                 }
 
                 ctx->enc.encoder_eof = ni_pkt->end_of_stream;
@@ -1740,20 +1914,13 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
 
     pthread_mutex_unlock(&ctx->io_mutex);
 
-    if (!got_packet || !copied_data) {
-        if (copied_data) bfree(copied_data);
+    if (!got_packet || !pkt) {
+        if (pkt) {
+            netint_release_packet(ctx, pkt);
+        }
         return false;
     }
 
-    struct netint_pkt *pkt = bzalloc(sizeof(*pkt));
-    if (!pkt) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] [IO THREAD] Failed to allocate queue packet");
-        bfree(copied_data);
-        return false;
-    }
-
-    pkt->data = copied_data;
-    pkt->size = copied_size;
     pkt->pts = pkt_pts;
     pkt->dts = pkt_dts;
     pkt->keyframe = pkt_keyframe;
@@ -1844,6 +2011,11 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     struct netint_ctx *ctx = data;
     *received = false;
 
+    if (ctx->last_delivered_pkt) {
+        netint_release_packet(ctx, ctx->last_delivered_pkt);
+        ctx->last_delivered_pkt = NULL;
+    }
+
 #ifdef DEBUG_NETINT_PLUGIN
     if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
         blog(LOG_ERROR, "[DEBUG] Invalid context magic in netint_encode: 0x%08X (expected 0x%08X)",
@@ -1886,9 +2058,17 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
             packet->priority = obs_parse_avc_packet_priority(packet);
         }
 
-        bfree(pkt);
+        ctx->last_delivered_pkt = pkt;
+        pkt = NULL;
         *received = true;
         delivered_packet = true;
+    } else {
+        packet->data = NULL;
+        packet->size = 0;
+        packet->pts = 0;
+        packet->dts = 0;
+        packet->keyframe = false;
+        packet->priority = 0;
     }
 
     if (!frame) {
@@ -1905,6 +2085,10 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
     if (!netint_queue_frame(ctx, frame)) {
         return false;
+    }
+
+    if (!delivered_packet && pkt) {
+        netint_release_packet(ctx, pkt);
     }
 
     if (!delivered_packet) {
