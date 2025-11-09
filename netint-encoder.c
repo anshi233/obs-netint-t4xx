@@ -178,8 +178,6 @@ struct netint_ctx {
     struct netint_pkt *last_delivered_pkt; /**< Packet most recently delivered to OBS */
     int pkt_pool_size;                 /**< Current number of packets in pool */
     int pkt_pool_capacity;             /**< Maximum packets retained in pool */
-    pthread_mutex_t pkt_pool_mutex;    /**< Protects packet pool access */
-    bool pkt_pool_mutex_initialized;
 
     struct netint_frame_job *frame_queue_head; /**< Pending frame jobs (host buffers ready for send) */
     struct netint_frame_job *frame_queue_tail;
@@ -263,6 +261,7 @@ static struct netint_frame_job *netint_acquire_job(struct netint_ctx *ctx, bool 
 static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *job);
 static struct netint_pkt *netint_acquire_packet(struct netint_ctx *ctx, size_t required_size);
 static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt);
+static void netint_release_packet_locked(struct netint_ctx *ctx, struct netint_pkt *pkt);
 static void netint_destroy_packet_pool(struct netint_ctx *ctx);
 static bool netint_init_packet_pool(struct netint_ctx *ctx);
 static void netint_free_packet(struct netint_pkt *pkt);
@@ -1259,14 +1258,6 @@ static bool netint_init_packet_pool(struct netint_ctx *ctx)
         ctx->pkt_pool_capacity = NETINT_PKT_POOL_MIN_CAPACITY;
     }
     ctx->last_delivered_pkt = NULL;
-
-    if (pthread_mutex_init(&ctx->pkt_pool_mutex, NULL) != 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize packet pool mutex");
-        ctx->pkt_pool_mutex_initialized = false;
-        return false;
-    }
-
-    ctx->pkt_pool_mutex_initialized = true;
     return true;
 }
 
@@ -1277,21 +1268,9 @@ static void netint_destroy_packet_pool(struct netint_ctx *ctx)
     }
 
     struct netint_pkt *head = NULL;
-
-    if (ctx->pkt_pool_mutex_initialized) {
-        pthread_mutex_lock(&ctx->pkt_pool_mutex);
-        head = ctx->pkt_pool_head;
-        ctx->pkt_pool_head = NULL;
-        ctx->pkt_pool_size = 0;
-        pthread_mutex_unlock(&ctx->pkt_pool_mutex);
-
-        pthread_mutex_destroy(&ctx->pkt_pool_mutex);
-        ctx->pkt_pool_mutex_initialized = false;
-    } else {
-        head = ctx->pkt_pool_head;
-        ctx->pkt_pool_head = NULL;
-        ctx->pkt_pool_size = 0;
-    }
+    head = ctx->pkt_pool_head;
+    ctx->pkt_pool_head = NULL;
+    ctx->pkt_pool_size = 0;
 
     while (head) {
         struct netint_pkt *next = head->next;
@@ -1310,14 +1289,22 @@ static struct netint_pkt *netint_acquire_packet(struct netint_ctx *ctx, size_t r
 
     struct netint_pkt *pkt = NULL;
 
-    if (ctx->pkt_pool_mutex_initialized) {
-        pthread_mutex_lock(&ctx->pkt_pool_mutex);
+    if (ctx->queue_mutex_initialized) {
+        pthread_mutex_lock(&ctx->queue_mutex);
         if (ctx->pkt_pool_head) {
             pkt = ctx->pkt_pool_head;
             ctx->pkt_pool_head = pkt->next;
+            if (ctx->pkt_pool_size > 0) {
+                ctx->pkt_pool_size--;
+            }
+        }
+        pthread_mutex_unlock(&ctx->queue_mutex);
+    } else if (ctx->pkt_pool_head) {
+        pkt = ctx->pkt_pool_head;
+        ctx->pkt_pool_head = pkt->next;
+        if (ctx->pkt_pool_size > 0) {
             ctx->pkt_pool_size--;
         }
-        pthread_mutex_unlock(&ctx->pkt_pool_mutex);
     }
 
     if (!pkt) {
@@ -1355,6 +1342,21 @@ static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt
         return;
     }
 
+    if (ctx->queue_mutex_initialized) {
+        pthread_mutex_lock(&ctx->queue_mutex);
+        netint_release_packet_locked(ctx, pkt);
+        pthread_mutex_unlock(&ctx->queue_mutex);
+    } else {
+        netint_free_packet(pkt);
+    }
+}
+
+static void netint_release_packet_locked(struct netint_ctx *ctx, struct netint_pkt *pkt)
+{
+    if (!ctx || !pkt) {
+        return;
+    }
+
     pkt->size = 0;
     pkt->pts = 0;
     pkt->dts = 0;
@@ -1362,19 +1364,13 @@ static void netint_release_packet(struct netint_ctx *ctx, struct netint_pkt *pkt
     pkt->priority = 0;
     pkt->next = NULL;
 
-    if (ctx->pkt_pool_mutex_initialized) {
-        pthread_mutex_lock(&ctx->pkt_pool_mutex);
-        if (ctx->pkt_pool_size < ctx->pkt_pool_capacity) {
-            pkt->next = ctx->pkt_pool_head;
-            ctx->pkt_pool_head = pkt;
-            ctx->pkt_pool_size++;
-            pthread_mutex_unlock(&ctx->pkt_pool_mutex);
-            return;
-        }
-        pthread_mutex_unlock(&ctx->pkt_pool_mutex);
+    if (ctx->pkt_pool_size < ctx->pkt_pool_capacity) {
+        pkt->next = ctx->pkt_pool_head;
+        ctx->pkt_pool_head = pkt;
+        ctx->pkt_pool_size++;
+    } else {
+        netint_free_packet(pkt);
     }
-
-    netint_free_packet(pkt);
 }
 
 static void netint_destroy_job_pool(struct netint_ctx *ctx)
@@ -2011,11 +2007,6 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
     struct netint_ctx *ctx = data;
     *received = false;
 
-    if (ctx->last_delivered_pkt) {
-        netint_release_packet(ctx, ctx->last_delivered_pkt);
-        ctx->last_delivered_pkt = NULL;
-    }
-
 #ifdef DEBUG_NETINT_PLUGIN
     if (ctx->debug_magic != NETINT_ENC_CONTEXT_MAGIC) {
         blog(LOG_ERROR, "[DEBUG] Invalid context magic in netint_encode: 0x%08X (expected 0x%08X)",
@@ -2029,6 +2020,11 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
     /* Check for packets produced by IO thread */
     pthread_mutex_lock(&ctx->queue_mutex);
+    if (ctx->last_delivered_pkt) {
+        netint_release_packet_locked(ctx, ctx->last_delivered_pkt);
+        ctx->last_delivered_pkt = NULL;
+    }
+
     struct netint_pkt *pkt = ctx->pkt_queue_head;
     if (pkt) {
         ctx->pkt_queue_head = pkt->next;
@@ -2085,10 +2081,6 @@ static bool netint_encode(void *data, struct encoder_frame *frame, struct encode
 
     if (!netint_queue_frame(ctx, frame)) {
         return false;
-    }
-
-    if (!delivered_packet && pkt) {
-        netint_release_packet(ctx, pkt);
     }
 
     if (!delivered_packet) {
