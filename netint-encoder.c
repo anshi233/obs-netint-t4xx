@@ -1504,6 +1504,21 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
             }
         }
 
+        if (ctx->codec_type == 0) {
+            if (ctx->frames_submitted == 0) {
+                for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+                    if (ctx->hw_plane_size[i] == 0)
+                        continue;
+                    blog(LOG_INFO,
+                         "[obs-netint-t4xx] [H264] Plane %d: src=%p dst=%p size=%zu src_stride=%d hw_stride=%d hw_height=%d job_capacity=%zu",
+                         i, (void *)src_planes[i], (void *)dest_planes[i],
+                         ctx->hw_plane_size[i], src_stride[i], ctx->hw_stride[i],
+                         ctx->hw_height[i], job->buffer_capacity);
+                }
+            }
+            can_bulk_copy = false;
+        }
+
         if (can_bulk_copy) {
             for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
                 if (ctx->hw_plane_size[i] == 0)
