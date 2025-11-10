@@ -184,6 +184,7 @@ struct netint_ctx {
     int pending_jobs;                 /**< Number of queued frame jobs */
     int inflight_frames;              /**< Count of frames submitted to HW but not yet drained */
     int max_inflight;                 /**< Maximum frames to keep in-flight before draining */
+    int max_pipeline_depth;           /**< Hard ceiling for (pending_jobs + inflight_frames) */
     uint64_t frames_submitted;        /**< Total frames enqueued (for start-of-stream decisions) */
 
     /* Reusable frame job pool */
@@ -253,7 +254,7 @@ static const char *netint_h265_get_name(void *type_data)
 /* Forward declarations */
 static void netint_destroy(void *data);
 static void *netint_io_thread(void *data);
-static void netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame);
+static bool netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame);
 static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool wait_for_job);
 static void netint_destroy_job_pool(struct netint_ctx *ctx);
 static bool netint_init_job_pool(struct netint_ctx *ctx);
@@ -530,6 +531,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     }
 
     ctx->max_inflight = 4; /* Allow up to 4 frames queued in hardware before draining */
+    ctx->max_pipeline_depth = 0; /* Will finalize after job pool init */
 
     if (!netint_init_packet_pool(ctx)) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize packet pool");
@@ -539,6 +541,11 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     if (!netint_init_job_pool(ctx)) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame job pool");
         goto fail;
+    }
+
+    ctx->max_pipeline_depth = ctx->job_pool_capacity;
+    if (ctx->max_pipeline_depth < ctx->max_inflight) {
+        ctx->max_pipeline_depth = ctx->max_inflight;
     }
     
     /* Initialize color space parameters (required by library) */
@@ -1566,9 +1573,24 @@ static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *
     bfree(job);
 }
 
-static void netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame)
+static bool netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *job, bool count_frame)
 {
+    if (!ctx->frame_queue_mutex_initialized) {
+        return false;
+    }
+
     pthread_mutex_lock(&ctx->frame_queue_mutex);
+
+    while (!ctx->stop_thread && ctx->frame_queue_cond_initialized &&
+           ctx->max_pipeline_depth > 0 &&
+           (ctx->pending_jobs + ctx->inflight_frames) >= ctx->max_pipeline_depth) {
+        pthread_cond_wait(&ctx->frame_queue_cond, &ctx->frame_queue_mutex);
+    }
+
+    if (ctx->stop_thread) {
+        pthread_mutex_unlock(&ctx->frame_queue_mutex);
+        return false;
+    }
 
     if (count_frame && ctx->frames_submitted == 0) {
         job->start_of_stream = true;
@@ -1589,8 +1611,11 @@ static void netint_enqueue_job(struct netint_ctx *ctx, struct netint_frame_job *
     }
 
     ctx->pending_jobs++;
-    pthread_cond_signal(&ctx->frame_queue_cond);
+    if (ctx->frame_queue_cond_initialized) {
+        pthread_cond_signal(&ctx->frame_queue_cond);
+    }
     pthread_mutex_unlock(&ctx->frame_queue_mutex);
+    return true;
 }
 
 static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool wait_for_job)
@@ -1599,6 +1624,9 @@ static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool 
 
     pthread_mutex_lock(&ctx->frame_queue_mutex);
     while (wait_for_job && !ctx->stop_thread && !ctx->frame_queue_head) {
+        if (!ctx->frame_queue_cond_initialized) {
+            break;
+        }
         pthread_cond_wait(&ctx->frame_queue_cond, &ctx->frame_queue_mutex);
     }
 
@@ -1610,6 +1638,9 @@ static struct netint_frame_job *netint_dequeue_job(struct netint_ctx *ctx, bool 
         }
         job->next = NULL;
         ctx->pending_jobs--;
+        if (ctx->frame_queue_cond_initialized) {
+            pthread_cond_broadcast(&ctx->frame_queue_cond);
+        }
     }
     pthread_mutex_unlock(&ctx->frame_queue_mutex);
 
@@ -1708,7 +1739,11 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
         }
     }
 
-    netint_enqueue_job(ctx, job, true);
+    if (!netint_enqueue_job(ctx, job, true)) {
+        blog(LOG_WARNING, "[obs-netint-t4xx] Failed to enqueue frame job (encoder shutting down?)");
+        netint_release_job(ctx, job);
+        return false;
+    }
     return true;
 }
 
@@ -1728,7 +1763,11 @@ static bool netint_queue_eos(struct netint_ctx *ctx)
     job->end_of_stream = true;
     job->start_of_stream = false;
 
-    netint_enqueue_job(ctx, job, false);
+    if (!netint_enqueue_job(ctx, job, false)) {
+        blog(LOG_WARNING, "[obs-netint-t4xx] Failed to enqueue EOS job (encoder shutting down)");
+        netint_release_job(ctx, job);
+        return false;
+    }
     return true;
 }
 
@@ -1952,6 +1991,9 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
     pthread_mutex_lock(&ctx->frame_queue_mutex);
     if (ctx->inflight_frames > 0) {
         ctx->inflight_frames--;
+    }
+    if (ctx->frame_queue_cond_initialized) {
+        pthread_cond_broadcast(&ctx->frame_queue_cond);
     }
     pthread_mutex_unlock(&ctx->frame_queue_mutex);
 
