@@ -163,11 +163,9 @@ struct netint_ctx {
     /* Background worker that manages both send and receive with pipelining */
     pthread_t io_thread;              /**< Background thread that handles encode_send/receive */
     pthread_mutex_t queue_mutex;      /**< Protects packet queue access ONLY */
-    pthread_mutex_t io_mutex;         /**< Serializes access to libxcoder context */
     pthread_mutex_t frame_queue_mutex; /**< Protects pending frame job queue */
     pthread_cond_t frame_queue_cond;  /**< Signals availability of frame jobs */
     bool queue_mutex_initialized;
-    bool io_mutex_initialized;
     bool frame_queue_mutex_initialized;
     bool frame_queue_cond_initialized;
     volatile bool stop_thread;        /**< Signal to background thread to stop */
@@ -946,19 +944,8 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     }
     ctx->queue_mutex_initialized = true;
 
-    if (pthread_mutex_init(&ctx->io_mutex, NULL) != 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize IO mutex");
-        pthread_mutex_destroy(&ctx->queue_mutex);
-        ctx->queue_mutex_initialized = false;
-        netint_destroy(ctx);
-        return NULL;
-    }
-    ctx->io_mutex_initialized = true;
-
     if (pthread_mutex_init(&ctx->frame_queue_mutex, NULL) != 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame queue mutex");
-        pthread_mutex_destroy(&ctx->io_mutex);
-        ctx->io_mutex_initialized = false;
         pthread_mutex_destroy(&ctx->queue_mutex);
         ctx->queue_mutex_initialized = false;
         netint_destroy(ctx);
@@ -970,8 +957,6 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         blog(LOG_ERROR, "[obs-netint-t4xx] Failed to initialize frame queue condition variable");
         pthread_mutex_destroy(&ctx->frame_queue_mutex);
         ctx->frame_queue_mutex_initialized = false;
-        pthread_mutex_destroy(&ctx->io_mutex);
-        ctx->io_mutex_initialized = false;
         pthread_mutex_destroy(&ctx->queue_mutex);
         ctx->queue_mutex_initialized = false;
         netint_destroy(ctx);
@@ -989,8 +974,6 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         ctx->frame_queue_cond_initialized = false;
         pthread_mutex_destroy(&ctx->frame_queue_mutex);
         ctx->frame_queue_mutex_initialized = false;
-        pthread_mutex_destroy(&ctx->io_mutex);
-        ctx->io_mutex_initialized = false;
         pthread_mutex_destroy(&ctx->queue_mutex);
         ctx->queue_mutex_initialized = false;
         netint_destroy(ctx);
@@ -1128,11 +1111,6 @@ static void netint_destroy(void *data)
     if (ctx->frame_queue_mutex_initialized) {
         pthread_mutex_destroy(&ctx->frame_queue_mutex);
         ctx->frame_queue_mutex_initialized = false;
-    }
-
-    if (ctx->io_mutex_initialized) {
-        pthread_mutex_destroy(&ctx->io_mutex);
-        ctx->io_mutex_initialized = false;
     }
 
     if (ctx->queue_mutex_initialized) {
@@ -1776,8 +1754,6 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
     bool success = false;
     bool allocated_buffer = false;
 
-    pthread_mutex_lock(&ctx->io_mutex);
-
     int get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
     if (get_ret < 0) {
         blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_get_frame failed (ret=%d)", get_ret);
@@ -1884,7 +1860,6 @@ done:
     if (allocated_buffer) {
         p_ni_logan_frame_buffer_free(&ctx->enc.p_input_fme->data.frame);
     }
-    pthread_mutex_unlock(&ctx->io_mutex);
     return success;
 }
 
@@ -1896,7 +1871,6 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
     bool pkt_keyframe = false;
     bool got_packet = false;
 
-    pthread_mutex_lock(&ctx->io_mutex);
     int recv_size = p_ni_logan_encode_receive(&ctx->enc);
 
     if (recv_size > 0) {
@@ -1958,12 +1932,9 @@ static bool netint_hw_receive_once(struct netint_ctx *ctx)
         }
     } else if (recv_size < 0) {
         if (ctx->enc.encoder_eof) {
-            pthread_mutex_unlock(&ctx->io_mutex);
             return false;
         }
     }
-
-    pthread_mutex_unlock(&ctx->io_mutex);
 
     if (!got_packet || !pkt) {
         if (pkt) {
