@@ -13,8 +13,8 @@
  * 
  * Encoding Flow:
  * 1. OBS calls netint_encode() with video frame
- * 2. Frame is copied into encoder's buffer via ni_logan_encode_copy_frame_data()
- * 3. Frame is sent to hardware via ni_logan_encode_send()
+ * 2. Frame data is copied once into a reusable hardware-aligned buffer
+ * 3. Buffer is submitted to hardware via ni_logan_encode_send()
  * 4. Background thread continuously calls ni_logan_encode_receive()
  * 5. Received packets are queued with metadata (PTS, DTS, keyframe flag)
  * 6. Main thread pops packets from queue and returns to OBS
@@ -76,9 +76,8 @@ struct netint_pkt {
 };
 
 struct netint_frame_job {
-    uint8_t *buffer;                  /**< Host copy of frame data laid out in HW format */
-    size_t buffer_size;               /**< Size of the buffer in bytes */
-    size_t buffer_capacity;           /**< Total capacity of allocated buffer */
+    ni_logan_frame_t hw_frame;        /**< Pre-allocated hardware frame buffer */
+    size_t hw_frame_capacity;         /**< Capacity of hardware buffer in bytes */
     int64_t pts;                      /**< Presentation/Decode timestamp */
     bool start_of_stream;             /**< Marks first frame to hardware */
     bool end_of_stream;               /**< Signals EOS to hardware */
@@ -193,11 +192,10 @@ struct netint_ctx {
     int job_pool_capacity;            /**< Maximum number of jobs preallocated */
 
     /* Precomputed hardware frame layout */
-    int hw_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS];
-    int hw_height[NI_LOGAN_MAX_NUM_DATA_POINTERS];
-    size_t hw_plane_size[NI_LOGAN_MAX_NUM_DATA_POINTERS];
-    size_t hw_plane_offset[NI_LOGAN_MAX_NUM_DATA_POINTERS];
-    size_t hw_frame_size;             /**< Total bytes for one HW-formatted frame */
+	int hw_stride[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+	int hw_height[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+	size_t hw_plane_size[NI_LOGAN_MAX_NUM_DATA_POINTERS];
+	size_t hw_frame_size;             /**< Total bytes for one HW-formatted frame */
 
     char *rc_mode;                     /**< Rate control mode: "CBR" or "VBR" */
     char *profile;                      /**< Encoder profile: H.264="baseline"/"main"/"high", H.265="main"/"main10" */
@@ -264,6 +262,8 @@ static void netint_release_packet_locked(struct netint_ctx *ctx, struct netint_p
 static void netint_destroy_packet_pool(struct netint_ctx *ctx);
 static bool netint_init_packet_pool(struct netint_ctx *ctx);
 static void netint_free_packet(struct netint_pkt *pkt);
+static bool netint_job_allocate_hw_frame(struct netint_ctx *ctx, struct netint_frame_job *job);
+static void netint_job_release_hw_frame(struct netint_frame_job *job);
 static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *frame);
 static bool netint_queue_eos(struct netint_ctx *ctx);
 static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job);
@@ -509,8 +509,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
 
     memset(ctx->hw_stride, 0, sizeof(ctx->hw_stride));
     memset(ctx->hw_height, 0, sizeof(ctx->hw_height));
-    memset(ctx->hw_plane_size, 0, sizeof(ctx->hw_plane_size));
-    memset(ctx->hw_plane_offset, 0, sizeof(ctx->hw_plane_offset));
+	memset(ctx->hw_plane_size, 0, sizeof(ctx->hw_plane_size));
 
     int bit_depth_factor = 1; /* Only 8-bit supported by OBS today */
     int is_h264 = (ctx->codec_type == 0) ? 1 : 0;
@@ -519,7 +518,6 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
 
     ctx->hw_frame_size = 0;
     for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
-        ctx->hw_plane_offset[i] = ctx->hw_frame_size;
         if (ctx->hw_stride[i] > 0 && ctx->hw_height[i] > 0) {
             ctx->hw_plane_size[i] = (size_t)ctx->hw_stride[i] * (size_t)ctx->hw_height[i];
             ctx->hw_frame_size += ctx->hw_plane_size[i];
@@ -1263,7 +1261,71 @@ static void netint_destroy_packet_pool(struct netint_ctx *ctx)
         head = next;
     }
 
-    ctx->pkt_pool_capacity = 0;
+	ctx->pkt_pool_capacity = 0;
+}
+
+static bool netint_job_allocate_hw_frame(struct netint_ctx *ctx, struct netint_frame_job *job)
+{
+	if (!ctx || !job) {
+		return false;
+	}
+
+	memset(&job->hw_frame, 0, sizeof(job->hw_frame));
+	job->hw_frame.extra_data_len = 64;
+
+	int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(&job->hw_frame, ctx->enc.width,
+							      ctx->enc.height, ctx->hw_stride,
+							      (ctx->codec_type == 0) ? 1 : 0,
+							      job->hw_frame.extra_data_len, 1);
+	if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
+		blog(LOG_ERROR,
+		     "[obs-netint-t4xx] Failed to allocate persistent frame buffer for job (ret=%d)",
+		     alloc_ret);
+		netint_log_error(ctx, "ni_logan_encoder_frame_buffer_alloc", alloc_ret);
+		memset(&job->hw_frame, 0, sizeof(job->hw_frame));
+		job->hw_frame_capacity = 0;
+		return false;
+	}
+
+	job->hw_frame_capacity = ctx->hw_frame_size;
+
+	for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+		if (ctx->hw_plane_size[i] > 0) {
+			job->hw_frame.data_len[i] = (uint32_t)ctx->hw_plane_size[i];
+		} else {
+			job->hw_frame.data_len[i] = 0;
+		}
+	}
+
+	job->hw_frame.video_width = ctx->enc.width;
+	job->hw_frame.video_height = ctx->enc.height;
+	job->hw_frame.video_orig_width = ctx->enc.width;
+	job->hw_frame.video_orig_height = ctx->enc.height;
+	job->hw_frame.color_primaries = (uint8_t)ctx->enc.color_primaries;
+	job->hw_frame.color_trc = (uint8_t)ctx->enc.color_trc;
+	job->hw_frame.color_space = (uint8_t)ctx->enc.color_space;
+	job->hw_frame.video_full_range_flag = ctx->enc.color_range;
+	job->hw_frame.sar_width = (uint16_t)ctx->enc.sar_num;
+	job->hw_frame.sar_height = (uint16_t)ctx->enc.sar_den;
+	job->hw_frame.vui_num_units_in_tick = (uint32_t)ctx->enc.timebase_num;
+	job->hw_frame.vui_time_scale = (uint32_t)ctx->enc.timebase_den;
+	job->hw_frame.bit_depth = 8;
+
+	return true;
+}
+
+static void netint_job_release_hw_frame(struct netint_frame_job *job)
+{
+	if (!job) {
+		return;
+	}
+
+	if (job->hw_frame.p_buffer && p_ni_logan_frame_buffer_free) {
+		p_ni_logan_frame_buffer_free(&job->hw_frame);
+	}
+
+	memset(&job->hw_frame, 0, sizeof(job->hw_frame));
+	job->hw_frame_capacity = 0;
 }
 
 static struct netint_pkt *netint_acquire_packet(struct netint_ctx *ctx, size_t required_size)
@@ -1379,14 +1441,12 @@ static void netint_destroy_job_pool(struct netint_ctx *ctx)
         ctx->job_pool_size = 0;
     }
 
-    while (head) {
-        struct netint_frame_job *next = head->next;
-        if (head->buffer) {
-            bfree(head->buffer);
-        }
-        bfree(head);
-        head = next;
-    }
+	while (head) {
+		struct netint_frame_job *next = head->next;
+		netint_job_release_hw_frame(head);
+		bfree(head);
+		head = next;
+	}
 
     ctx->job_pool_capacity = 0;
 }
@@ -1421,20 +1481,10 @@ static bool netint_init_job_pool(struct netint_ctx *ctx)
         }
 
         job->from_pool = true;
-        job->buffer_capacity = ctx->hw_frame_size;
-        job->buffer_size = ctx->hw_frame_size;
-
-        if (ctx->hw_frame_size > 0) {
-            job->buffer = bmalloc(ctx->hw_frame_size);
-            if (!job->buffer) {
-                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte buffer for job pool entry",
-                     ctx->hw_frame_size);
-                bfree(job);
-                netint_destroy_job_pool(ctx);
-                return false;
-            }
-        } else {
-            job->buffer = NULL;
+		if (!netint_job_allocate_hw_frame(ctx, job)) {
+			bfree(job);
+			netint_destroy_job_pool(ctx);
+			return false;
         }
 
         job->next = ctx->job_pool_head;
@@ -1461,61 +1511,35 @@ static struct netint_frame_job *netint_acquire_job(struct netint_ctx *ctx, bool 
         pthread_mutex_unlock(&ctx->job_pool_mutex);
     }
 
-    if (job) {
-        job->next = NULL;
-        job->buffer_size = ctx->hw_frame_size;
-        job->from_pool = true;
+	if (job) {
+		job->next = NULL;
+		job->from_pool = true;
 
-        if (require_buffer && ctx->hw_frame_size > 0) {
-            if (job->buffer_capacity < ctx->hw_frame_size) {
-                uint8_t *new_buffer = (uint8_t *)brealloc(job->buffer, ctx->hw_frame_size);
-                if (!new_buffer) {
-                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to grow pooled frame buffer to %zu bytes",
-                         ctx->hw_frame_size);
-                    job->next = NULL;
-                    job->buffer_size = job->buffer_capacity;
-                    netint_release_job(ctx, job);
-                    return NULL;
-                }
-                job->buffer = new_buffer;
-                job->buffer_capacity = ctx->hw_frame_size;
-            }
-            if (!job->buffer) {
-                job->buffer = bmalloc(ctx->hw_frame_size);
-                if (!job->buffer) {
-                    blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate pooled frame buffer (%zu bytes)",
-                         ctx->hw_frame_size);
-                    netint_release_job(ctx, job);
-                    return NULL;
-                }
-                job->buffer_capacity = ctx->hw_frame_size;
-            }
-        }
+		if (require_buffer && ctx->hw_frame_size > 0 &&
+		    job->hw_frame_capacity < ctx->hw_frame_size) {
+			netint_job_release_hw_frame(job);
+			if (!netint_job_allocate_hw_frame(ctx, job)) {
+				netint_release_job(ctx, job);
+				return NULL;
+			}
+		}
 
-        return job;
-    }
+		return job;
+	}
 
-    job = bzalloc(sizeof(*job));
-    if (!job) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame job (pool empty)");
-        return NULL;
-    }
+	job = bzalloc(sizeof(*job));
+	if (!job) {
+		blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame job (pool empty)");
+		return NULL;
+	}
 
-    job->from_pool = false;
-    job->buffer_capacity = ctx->hw_frame_size;
-    job->buffer_size = ctx->hw_frame_size;
+	job->from_pool = false;
+	if (!netint_job_allocate_hw_frame(ctx, job)) {
+		bfree(job);
+		return NULL;
+	}
 
-    if (require_buffer && ctx->hw_frame_size > 0) {
-        job->buffer = bmalloc(ctx->hw_frame_size);
-        if (!job->buffer) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate %zu-byte frame buffer (pool empty)",
-                 ctx->hw_frame_size);
-            bfree(job);
-            return NULL;
-        }
-    }
-
-    return job;
+	return job;
 }
 
 static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *job)
@@ -1528,7 +1552,7 @@ static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *
         job->pts = 0;
         job->start_of_stream = false;
         job->end_of_stream = false;
-        job->buffer_size = ctx->hw_frame_size;
+		job->hw_frame_capacity = ctx->hw_frame_size;
         job->next = NULL;
 
         pthread_mutex_lock(&ctx->job_pool_mutex);
@@ -1543,11 +1567,7 @@ static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *
         /* Pool full - fall through to free */
     }
 
-    if (job->buffer) {
-        bfree(job->buffer);
-        job->buffer = NULL;
-    }
-
+	netint_job_release_hw_frame(job);
     bfree(job);
 }
 
@@ -1633,21 +1653,31 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
         return false;
     }
 
-    job->buffer_size = ctx->hw_frame_size;
+	if (ctx->hw_frame_size > 0 &&
+	    (!job->hw_frame.p_buffer || job->hw_frame_capacity < ctx->hw_frame_size)) {
+		netint_job_release_hw_frame(job);
+		if (!netint_job_allocate_hw_frame(ctx, job)) {
+			blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate hardware buffer for frame job");
+			netint_release_job(ctx, job);
+			return false;
+		}
+	}
+
     job->pts = frame->pts;
     job->end_of_stream = false;
     job->start_of_stream = false;
 
     if (ctx->hw_frame_size > 0) {
-        if (!job->buffer) {
-            blog(LOG_ERROR, "[obs-netint-t4xx] Frame job missing buffer (%zu bytes expected)", ctx->hw_frame_size);
+		if (!job->hw_frame.p_data[0]) {
+			blog(LOG_ERROR, "[obs-netint-t4xx] Frame job missing hardware buffer (%zu bytes expected)",
+			     ctx->hw_frame_size);
             netint_release_job(ctx, job);
             return false;
         }
         uint8_t *dest_planes[NI_LOGAN_MAX_NUM_DATA_POINTERS] = {0};
         for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
             if (ctx->hw_plane_size[i] > 0) {
-                dest_planes[i] = job->buffer + ctx->hw_plane_offset[i];
+				dest_planes[i] = (uint8_t *)job->hw_frame.p_data[i];
             }
         }
 
@@ -1692,7 +1722,7 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
                          "[obs-netint-t4xx] [H264] Plane %d: src=%p dst=%p size=%zu src_stride=%d hw_stride=%d hw_height=%d job_capacity=%zu",
                          i, (void *)src_planes[i], (void *)dest_planes[i],
                          ctx->hw_plane_size[i], src_stride[i], ctx->hw_stride[i],
-                         ctx->hw_height[i], job->buffer_capacity);
+					     ctx->hw_height[i], job->hw_frame_capacity);
                 }
             }
             can_bulk_copy = false;
@@ -1717,6 +1747,13 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
         }
     }
 
+	job->hw_frame.pts = job->pts;
+	job->hw_frame.dts = job->pts;
+	job->hw_frame.start_of_stream = job->start_of_stream ? 1 : 0;
+	job->hw_frame.end_of_stream = 0;
+	job->hw_frame.force_key_frame = job->start_of_stream ? 1 : 0;
+	job->hw_frame.ni_logan_pict_type = job->start_of_stream ? LOGAN_PIC_TYPE_IDR : 0;
+
     if (!netint_enqueue_job(ctx, job, true)) {
         blog(LOG_WARNING, "[obs-netint-t4xx] Failed to enqueue frame job (encoder shutting down?)");
         netint_release_job(ctx, job);
@@ -1736,10 +1773,15 @@ static bool netint_queue_eos(struct netint_ctx *ctx)
         }
     }
 
-    job->buffer_size = 0;
     job->pts = 0;
     job->end_of_stream = true;
     job->start_of_stream = false;
+	job->hw_frame.pts = 0;
+	job->hw_frame.dts = 0;
+	job->hw_frame.start_of_stream = 0;
+	job->hw_frame.end_of_stream = 1;
+	job->hw_frame.force_key_frame = 0;
+	job->hw_frame.ni_logan_pict_type = 0;
 
     if (!netint_enqueue_job(ctx, job, false)) {
         blog(LOG_WARNING, "[obs-netint-t4xx] Failed to enqueue EOS job (encoder shutting down)");
@@ -1751,116 +1793,81 @@ static bool netint_queue_eos(struct netint_ctx *ctx)
 
 static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *job)
 {
-    bool success = false;
-    bool allocated_buffer = false;
+	bool success = false;
 
-    int get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
-    if (get_ret < 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_get_frame failed (ret=%d)", get_ret);
-        netint_log_error(ctx, "ni_logan_encode_get_frame", get_ret);
-        goto done;
-    }
+	int get_ret = p_ni_logan_encode_get_frame(&ctx->enc);
+	if (get_ret < 0) {
+		blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_get_frame failed (ret=%d)", get_ret);
+		netint_log_error(ctx, "ni_logan_encode_get_frame", get_ret);
+		return false;
+	}
 
-    ni_logan_session_data_io_t *input_fme = ctx->enc.p_input_fme;
-    if (!input_fme) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] p_input_fme is NULL after encode_get_frame");
-        goto done;
-    }
+	ni_logan_session_data_io_t *input_fme = ctx->enc.p_input_fme;
+	if (!input_fme) {
+		blog(LOG_ERROR, "[obs-netint-t4xx] p_input_fme is NULL after encode_get_frame");
+		return false;
+	}
 
-    ni_logan_frame_t *ni_frame = &input_fme->data.frame;
-    ni_frame->extra_data_len = 64;
+	ni_logan_frame_t *ni_frame = &input_fme->data.frame;
 
-    int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(
-        ni_frame,
-        ctx->enc.width,
-        ctx->enc.height,
-        ctx->hw_stride,
-        (ctx->codec_type == 0) ? 1 : 0,
-        ni_frame->extra_data_len,
-        1);
+	if (!job->end_of_stream && ctx->hw_frame_size > 0) {
+		if (!job->hw_frame.p_buffer) {
+			blog(LOG_ERROR, "[obs-netint-t4xx] Job missing pre-allocated hardware buffer");
+			return false;
+		}
 
-    if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] Failed to allocate frame buffer (ret=%d)", alloc_ret);
-        netint_log_error(ctx, "ni_logan_encoder_frame_buffer_alloc", alloc_ret);
-        goto done;
-    }
-    allocated_buffer = true;
+		*ni_frame = job->hw_frame;
+	} else {
+		memset(ni_frame, 0, sizeof(*ni_frame));
+	}
 
-    if (ctx->hw_frame_size > 0 && ni_frame->p_data[0]) {
-        bool planes_contiguous = true;
-        size_t expected_offset = 0;
-        uint8_t *base_ptr = (uint8_t *)ni_frame->p_data[0];
-        for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
-            if (ctx->hw_plane_size[i] == 0)
-                continue;
+	ni_frame->video_width = ctx->enc.width;
+	ni_frame->video_height = ctx->enc.height;
+	ni_frame->video_orig_width = ctx->enc.width;
+	ni_frame->video_orig_height = ctx->enc.height;
+	ni_frame->pts = job->end_of_stream ? 0 : job->pts;
+	ni_frame->dts = ni_frame->pts;
+	ni_frame->start_of_stream = job->start_of_stream ? 1 : 0;
+	ni_frame->end_of_stream = job->end_of_stream ? 1 : 0;
+	ni_frame->force_key_frame = job->start_of_stream ? 1 : 0;
+	ni_frame->ni_logan_pict_type = job->start_of_stream ? LOGAN_PIC_TYPE_IDR : 0;
+	ni_frame->bit_depth = 8;
+	ni_frame->color_primaries = (uint8_t)ctx->enc.color_primaries;
+	ni_frame->color_trc = (uint8_t)ctx->enc.color_trc;
+	ni_frame->color_space = (uint8_t)ctx->enc.color_space;
+	ni_frame->video_full_range_flag = ctx->enc.color_range;
+	ni_frame->extra_data_len = job->hw_frame.extra_data_len;
 
-            if (!ni_frame->p_data[i] ||
-                (uint8_t *)ni_frame->p_data[i] != base_ptr + expected_offset) {
-                planes_contiguous = false;
-                break;
-            }
+	for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+		if (ctx->hw_plane_size[i] > 0) {
+			ni_frame->data_len[i] = (uint32_t)ctx->hw_plane_size[i];
+		} else {
+			ni_frame->data_len[i] = 0;
+		}
+	}
 
-            expected_offset += ctx->hw_plane_size[i];
-        }
-        planes_contiguous = planes_contiguous && expected_offset == ctx->hw_frame_size;
+	int send_ret = p_ni_logan_encode_send(&ctx->enc);
+	if (send_ret < 0) {
+		blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_send failed (ret=%d)", send_ret);
+		netint_log_error(ctx, "ni_logan_encode_send", send_ret);
+		return false;
+	}
 
-        if (!job->end_of_stream && job->buffer) {
-            if (planes_contiguous) {
-                memcpy(base_ptr, job->buffer, ctx->hw_frame_size);
-            } else {
-                size_t offset = 0;
-                for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
-                    if (ctx->hw_plane_size[i] > 0 && ni_frame->p_data[i]) {
-                        memcpy((uint8_t *)ni_frame->p_data[i], job->buffer + offset,
-                               ctx->hw_plane_size[i]);
-                        offset += ctx->hw_plane_size[i];
-                    }
-                }
-            }
-        }
-    }
+	if (!ctx->enc.started) {
+		ctx->enc.started = 1;
+		blog(LOG_INFO, "[obs-netint-t4xx] Encoder marked as started (ni_logan_encode_send success)");
+	}
 
-    ni_frame->video_width = ctx->enc.width;
-    ni_frame->video_height = ctx->enc.height;
-    ni_frame->video_orig_width = ctx->enc.width;
-    ni_frame->video_orig_height = ctx->enc.height;
-    ni_frame->pts = job->end_of_stream ? 0 : job->pts;
-    ni_frame->dts = ni_frame->pts;
-    ni_frame->start_of_stream = job->start_of_stream ? 1 : 0;
-    ni_frame->end_of_stream = job->end_of_stream ? 1 : 0;
-    ni_frame->force_key_frame = job->start_of_stream ? 1 : 0;
-    ni_frame->ni_logan_pict_type = job->start_of_stream ? LOGAN_PIC_TYPE_IDR : 0;
-    ni_frame->bit_depth = 8;
-    ni_frame->color_primaries = (uint8_t)ctx->enc.color_primaries;
-    ni_frame->color_trc = (uint8_t)ctx->enc.color_trc;
-    ni_frame->color_space = (uint8_t)ctx->enc.color_space;
-    ni_frame->video_full_range_flag = ctx->enc.color_range;
+	if (!job->end_of_stream) {
+		ctx->frame_count++;
+	}
 
-    int send_ret = p_ni_logan_encode_send(&ctx->enc);
-    if (send_ret < 0) {
-        blog(LOG_ERROR, "[obs-netint-t4xx] ni_logan_encode_send failed (ret=%d)", send_ret);
-        netint_log_error(ctx, "ni_logan_encode_send", send_ret);
-        goto done;
-    }
+	ctx->consecutive_errors = 0;
+	success = true;
 
-    if (!ctx->enc.started) {
-        ctx->enc.started = 1;
-        blog(LOG_INFO, "[obs-netint-t4xx] Encoder marked as started (ni_logan_encode_send success)");
-    }
+	netint_job_release_hw_frame(job);
 
-    if (!job->end_of_stream) {
-        ctx->frame_count++;
-
-    }
-
-    ctx->consecutive_errors = 0;
-    success = true;
-
-done:
-    if (allocated_buffer) {
-        p_ni_logan_frame_buffer_free(&ctx->enc.p_input_fme->data.frame);
-    }
-    return success;
+	return success;
 }
 
 static bool netint_hw_receive_once(struct netint_ctx *ctx)
@@ -2404,13 +2411,12 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
  * - get_extra_data: Returns SPS/PPS headers for stream initialization
  * 
  * Capability Flags (caps):
- * - Currently set to 0 because:
- *   - Not deprecated (OBS_ENCODER_CAP_DEPRECATED)
- *   - Doesn't pass textures directly (OBS_ENCODER_CAP_PASS_TEXTURE)
- *   - Doesn't support dynamic bitrate changes (OBS_ENCODER_CAP_DYN_BITRATE)
- *   - Not an internal OBS encoder (OBS_ENCODER_CAP_INTERNAL)
- *   - Region of Interest not implemented (OBS_ENCODER_CAP_ROI)
- *   - Scaling not implemented (OBS_ENCODER_CAP_SCALING)
+ * - OBS_ENCODER_CAP_SCALING: The encoder consumes whatever scaled width/height OBS configured.
+ * - Not advertised:
+ *   - OBS_ENCODER_CAP_PASS_TEXTURE (CPU frame ingest only)
+ *   - OBS_ENCODER_CAP_DYN_BITRATE (libxcoder lacks live reconfigure path in this integration)
+ *   - OBS_ENCODER_CAP_ROI (ROI metadata not yet translated)
+ *   - OBS_ENCODER_CAP_INTERNAL / OBS_ENCODER_CAP_DEPRECATED (public, fully supported encoder)
  * 
  * Optional Callbacks (explicitly NULL):
  * - get_sei_data: Not implemented (returns NULL)
@@ -2425,7 +2431,7 @@ static struct obs_encoder_info netint_h264_info = {
     .id = "obs_netint_t4xx_h264",      /**< Unique identifier for this encoder */
     .codec = "h264",                   /**< Codec string (matches OBS codec type) */
     .type = OBS_ENCODER_VIDEO,        /**< Encoder type: video encoder */
-    .caps = 0,                         /**< Capability flags - see documentation above */
+    .caps = OBS_ENCODER_CAP_SCALING,   /**< Accepts OBS-supplied scaled frames (width/height set per instance) */
     .get_name = netint_h264_get_name,  /**< Returns "NETINT T4XX H.264" */
     .create = netint_create,
     .destroy = netint_destroy,
@@ -2445,7 +2451,7 @@ static struct obs_encoder_info netint_h265_info = {
     .id = "obs_netint_t4xx_h265",      /**< Unique identifier for this encoder */
     .codec = "hevc",                   /**< Codec string (OBS uses "hevc" for H.265) */
     .type = OBS_ENCODER_VIDEO,        /**< Encoder type: video encoder */
-    .caps = 0,                         /**< Capability flags - see documentation above */
+    .caps = OBS_ENCODER_CAP_SCALING,   /**< Accepts OBS-supplied scaled frames (width/height set per instance) */
     .get_name = netint_h265_get_name,  /**< Returns "NETINT T4XX H.265" */
     .create = netint_create,
     .destroy = netint_destroy,
