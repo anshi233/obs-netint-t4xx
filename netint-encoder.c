@@ -1810,6 +1810,9 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
 
 	ni_logan_frame_t *ni_frame = &input_fme->data.frame;
 
+	bool eos_frame_allocated = false;
+	ni_logan_frame_t eos_frame;
+
 	if (!job->end_of_stream && ctx->hw_frame_size > 0) {
 		if (!job->hw_frame.p_buffer) {
 			blog(LOG_ERROR, "[obs-netint-t4xx] Job missing pre-allocated hardware buffer");
@@ -1817,6 +1820,22 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
 		}
 
 		*ni_frame = job->hw_frame;
+	} else if (job->end_of_stream) {
+		memset(&eos_frame, 0, sizeof(eos_frame));
+		eos_frame.extra_data_len = 64;
+
+		int alloc_ret = p_ni_logan_encoder_frame_buffer_alloc(
+			&eos_frame, ctx->enc.width, ctx->enc.height, ctx->hw_stride,
+			(ctx->codec_type == 0) ? 1 : 0, eos_frame.extra_data_len, 1);
+		if (alloc_ret != NI_LOGAN_RETCODE_SUCCESS) {
+			blog(LOG_WARNING,
+			     "[obs-netint-t4xx] Failed to allocate temporary EOS frame buffer (ret=%d)",
+			     alloc_ret);
+			memset(ni_frame, 0, sizeof(*ni_frame));
+		} else {
+			*ni_frame = eos_frame;
+			eos_frame_allocated = true;
+		}
 	} else {
 		memset(ni_frame, 0, sizeof(*ni_frame));
 	}
@@ -1836,7 +1855,7 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
 	ni_frame->color_trc = (uint8_t)ctx->enc.color_trc;
 	ni_frame->color_space = (uint8_t)ctx->enc.color_space;
 	ni_frame->video_full_range_flag = ctx->enc.color_range;
-	ni_frame->extra_data_len = job->hw_frame.extra_data_len;
+	ni_frame->extra_data_len = job->end_of_stream ? 0 : job->hw_frame.extra_data_len;
 
 	for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
 		if (ctx->hw_plane_size[i] > 0) {
@@ -1865,7 +1884,17 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
 	ctx->consecutive_errors = 0;
 	success = true;
 
-	netint_job_release_hw_frame(job);
+	for (int i = 0; i < NI_LOGAN_MAX_NUM_DATA_POINTERS; i++) {
+		ni_frame->p_data[i] = NULL;
+		ni_frame->data_len[i] = 0;
+	}
+	ni_frame->p_buffer = NULL;
+	ni_frame->buffer_size = 0;
+	ni_frame->extra_data_len = 0;
+
+	if (eos_frame_allocated && p_ni_logan_frame_buffer_free) {
+		p_ni_logan_frame_buffer_free(&eos_frame);
+	}
 
 	return success;
 }
