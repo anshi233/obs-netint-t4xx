@@ -120,7 +120,7 @@ struct netint_frame_job {
 /**
  * @brief Minimum number of reusable frame jobs to keep in the pool
  */
-#define NETINT_JOB_POOL_MIN_CAPACITY 6
+#define NETINT_JOB_POOL_MIN_CAPACITY 20
 
 /**
  * @brief Minimum number of reusable packet buffers to keep in the pool
@@ -526,7 +526,7 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         }
     }
 
-    ctx->max_inflight = 4; /* Allow up to 4 frames queued in hardware before draining */
+    ctx->max_inflight = 8; /* Allow up to 8 frames queued in hardware before draining */
     ctx->max_pipeline_depth = 0; /* Will finalize after job pool init */
 
     if (!netint_init_packet_pool(ctx)) {
