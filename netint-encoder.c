@@ -53,6 +53,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <stdio.h>
+#include <math.h>
 #include "netint-libxcoder-shim.h"
 
 /**
@@ -82,6 +83,8 @@ struct netint_frame_job {
     bool start_of_stream;             /**< Marks first frame to hardware */
     bool end_of_stream;               /**< Signals EOS to hardware */
     bool from_pool;                   /**< Indicates job originated from reusable pool */
+    uint8_t *roi_data;                /**< Optional ROI side data (array of ni_region_of_interest_t) */
+    size_t roi_data_size;             /**< Size of ROI side data in bytes */
     struct netint_frame_job *next;    /**< Next job in queue */
 };
 
@@ -152,6 +155,69 @@ typedef enum {
     NETINT_ENCODER_STATE_RECOVERING   /**< Encoder is attempting recovery */
 } netint_encoder_state_t;
 
+struct netint_roi_entry {
+    uint32_t self_size;
+    int32_t top;
+    int32_t bottom;
+    int32_t left;
+    int32_t right;
+    struct {
+        int32_t num;
+        int32_t den;
+    } qoffset;
+};
+
+struct netint_roi_fill_ctx {
+    struct netint_roi_entry *entries;
+    size_t index;
+    uint32_t width;
+    uint32_t height;
+};
+
+static inline uint32_t netint_clamp_u32(uint32_t value, uint32_t min_val, uint32_t max_val)
+{
+    if (value < min_val)
+        return min_val;
+    if (value > max_val)
+        return max_val;
+    return value;
+}
+
+static void netint_roi_count_cb(void *param, struct obs_encoder_roi *roi)
+{
+    UNUSED_PARAMETER(roi);
+    size_t *count = param;
+    (*count)++;
+}
+
+static void netint_roi_fill_cb(void *param, struct obs_encoder_roi *roi)
+{
+    struct netint_roi_fill_ctx *ctx = param;
+    struct netint_roi_entry *entry = &ctx->entries[ctx->index++];
+
+    uint32_t max_height = ctx->height ? ctx->height : 1;
+    uint32_t max_width = ctx->width ? ctx->width : 1;
+
+    uint32_t top = netint_clamp_u32(roi->top, 0, max_height - 1);
+    uint32_t bottom = netint_clamp_u32(roi->bottom, top + 1, max_height);
+    uint32_t left = netint_clamp_u32(roi->left, 0, max_width - 1);
+    uint32_t right = netint_clamp_u32(roi->right, left + 1, max_width);
+
+    float priority = roi->priority;
+    if (priority > 1.0f)
+        priority = 1.0f;
+    else if (priority < -1.0f)
+        priority = -1.0f;
+
+    entry->self_size = (uint32_t)sizeof(*entry);
+    entry->top = (int32_t)top;
+    entry->bottom = (int32_t)bottom;
+    entry->left = (int32_t)left;
+    entry->right = (int32_t)right;
+    entry->qoffset.num = (int32_t)lroundf(priority * 1000.0f);
+    entry->qoffset.den = 1000;
+}
+
 struct netint_ctx {
     obs_encoder_t *encoder;           /**< OBS encoder handle (for accessing video info, etc.) */
     ni_logan_enc_context_t enc;       /**< NETINT libxcoder encoder context (hardware state) - EMBEDDED like FFmpeg does */
@@ -210,6 +276,9 @@ struct netint_ctx {
     int qp_min;                        /**< Minimum QP when rate control enabled */
     int qp_max;                        /**< Maximum QP when rate control enabled */
     bool lossless;                     /**< Lossless encoding enabled (HEVC only, RC disabled) */
+    bool roi_enabled;                  /**< ROI functionality enabled */
+    bool roi_cache;                    /**< Reuse last ROI map when not provided */
+    bool roi_supported;                /**< Library exposes ROI helper APIs */
 
     /* Error tracking and health monitoring */
     int consecutive_errors;            /**< Count of consecutive errors (reset on success) */
@@ -607,6 +676,13 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         ctx->qp_min = ctx->qp_max;
         ctx->qp_max = tmp;
     }
+
+    ctx->roi_supported = (p_ni_logan_enc_prep_aux_data != NULL);
+    ctx->roi_enabled = obs_data_get_bool(settings, "roi_enable") && ctx->roi_supported;
+    ctx->roi_cache = obs_data_get_bool(settings, "roi_cache") && ctx->roi_enabled;
+    if (obs_data_get_bool(settings, "roi_enable") && !ctx->roi_supported) {
+        blog(LOG_WARNING, "[obs-netint-t4xx] ROI was requested but libxcoder lacks ni_logan_enc_prep_aux_data; disabling ROI");
+    }
     if (ctx->codec_type == 1) {
         ctx->lossless = obs_data_get_bool(settings, "lossless");
         if (ctx->lossless && (!ctx->rc_mode || strcmp(ctx->rc_mode, "DISABLED") != 0)) {
@@ -747,6 +823,22 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
             goto fail;
         }
         blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s", gop_desc);
+
+        const char *roi_enable_str = (ctx->roi_enabled && ctx->roi_supported) ? "1" : "0";
+        if (!netint_set_encoder_param(ctx, params, session_ctx, NI_LOGAN_ENC_PARAM_ROI_ENABLE, roi_enable_str)) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to %s ROI feature", (roi_enable_str[0] == '1') ? "enable" : "disable");
+            goto fail;
+        }
+        blog(LOG_INFO, "[obs-netint-t4xx] ROI feature %s", (roi_enable_str[0] == '1') ? "enabled" : "disabled");
+
+        const char *cache_roi_str = (ctx->roi_enabled && ctx->roi_cache && ctx->roi_supported) ? "1" : "0";
+        if (!netint_set_encoder_param(ctx, params, session_ctx, NI_LOGAN_ENC_PARAM_CACHE_ROI, cache_roi_str)) {
+            blog(LOG_ERROR, "[obs-netint-t4xx] Failed to configure ROI cache mode");
+            goto fail;
+        }
+        if (cache_roi_str[0] == '1') {
+            blog(LOG_INFO, "[obs-netint-t4xx] ROI cache enabled (encoder will reuse previous ROI map when absent)");
+        }
 
         if (ctx->keyint_frames > 0) {
             char intraperiod_str[32];
@@ -1508,6 +1600,11 @@ static void netint_destroy_job_pool(struct netint_ctx *ctx)
 
 	while (head) {
 		struct netint_frame_job *next = head->next;
+        if (head->roi_data) {
+            bfree(head->roi_data);
+            head->roi_data = NULL;
+            head->roi_data_size = 0;
+        }
 		netint_job_release_hw_frame(head);
 		bfree(head);
 		head = next;
@@ -1579,6 +1676,8 @@ static struct netint_frame_job *netint_acquire_job(struct netint_ctx *ctx, bool 
 	if (job) {
 		job->next = NULL;
 		job->from_pool = true;
+        job->roi_data = NULL;
+        job->roi_data_size = 0;
 
 		if (require_buffer && ctx->hw_frame_size > 0 &&
 		    job->hw_frame_capacity < ctx->hw_frame_size) {
@@ -1611,6 +1710,12 @@ static void netint_release_job(struct netint_ctx *ctx, struct netint_frame_job *
 {
     if (!job) {
         return;
+    }
+
+    if (job->roi_data) {
+        bfree(job->roi_data);
+        job->roi_data = NULL;
+        job->roi_data_size = 0;
     }
 
     if (job->from_pool && ctx->job_pool_mutex_initialized) {
@@ -1819,6 +1924,34 @@ static bool netint_queue_frame(struct netint_ctx *ctx, struct encoder_frame *fra
 	job->hw_frame.force_key_frame = job->start_of_stream ? 1 : 0;
 	job->hw_frame.ni_logan_pict_type = job->start_of_stream ? LOGAN_PIC_TYPE_IDR : 0;
 
+    if (job->roi_data) {
+        bfree(job->roi_data);
+        job->roi_data = NULL;
+        job->roi_data_size = 0;
+    }
+
+    if (ctx->roi_enabled && ctx->roi_supported && p_ni_logan_enc_prep_aux_data && obs_encoder_has_roi(ctx->encoder)) {
+        size_t roi_count = 0;
+        obs_encoder_enum_roi(ctx->encoder, netint_roi_count_cb, &roi_count);
+        if (roi_count > 0) {
+            size_t roi_bytes = roi_count * sizeof(struct netint_roi_entry);
+            struct netint_roi_entry *entries = bzalloc(roi_bytes);
+            if (!entries) {
+                blog(LOG_WARNING, "[obs-netint-t4xx] Failed to allocate ROI side data (%zu bytes)", roi_bytes);
+            } else {
+                struct netint_roi_fill_ctx fill_ctx = {
+                    .entries = entries,
+                    .index = 0,
+                    .width = (uint32_t)ctx->enc.width,
+                    .height = (uint32_t)ctx->enc.height,
+                };
+                obs_encoder_enum_roi(ctx->encoder, netint_roi_fill_cb, &fill_ctx);
+                job->roi_data = (uint8_t *)entries;
+                job->roi_data_size = roi_bytes;
+            }
+        }
+    }
+
     if (!netint_enqueue_job(ctx, job, true)) {
         blog(LOG_WARNING, "[obs-netint-t4xx] Failed to enqueue frame job (encoder shutting down?)");
         netint_release_job(ctx, job);
@@ -1929,6 +2062,26 @@ static bool netint_hw_send_job(struct netint_ctx *ctx, struct netint_frame_job *
 			ni_frame->data_len[i] = 0;
 		}
 	}
+
+    if (ctx->roi_enabled && ctx->roi_supported && p_ni_logan_enc_prep_aux_data) {
+        ni_logan_frame_t roi_frame;
+        memset(&roi_frame, 0, sizeof(roi_frame));
+        ni_aux_data_t roi_aux;
+        if (job->roi_data && job->roi_data_size > 0) {
+            roi_aux.type = NI_FRAME_AUX_DATA_REGIONS_OF_INTEREST;
+            roi_aux.data = job->roi_data;
+            roi_aux.size = (int)job->roi_data_size;
+            roi_frame.nb_aux_data = 1;
+            roi_frame.aux_data[0] = &roi_aux;
+        }
+        roi_frame.video_width = ctx->enc.width;
+        roi_frame.video_height = ctx->enc.height;
+        p_ni_logan_enc_prep_aux_data((ni_logan_session_context_t *)ctx->enc.p_session_ctx,
+                                     ni_frame,
+                                     &roi_frame,
+                                     ctx->enc.codec_format,
+                                     0, NULL, NULL, NULL, NULL, NULL);
+    }
 
 	int send_ret = p_ni_logan_encode_send(&ctx->enc);
 	if (send_ret < 0) {
@@ -2242,6 +2395,10 @@ static void netint_h264_get_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "qp_min", 18);
     obs_data_set_default_int(settings, "qp_max", 42);
 
+    /* ROI disabled by default; cache enabled when ROI active */
+    obs_data_set_default_bool(settings, "roi_enable", false);
+    obs_data_set_default_bool(settings, "roi_cache", true);
+
     /* Lossless disabled by default */
     obs_data_set_default_bool(settings, "lossless", false);
     
@@ -2279,6 +2436,10 @@ static void netint_h265_get_defaults(obs_data_t *settings)
     /* Default QP limits when rate control is enabled */
     obs_data_set_default_int(settings, "qp_min", 18);
     obs_data_set_default_int(settings, "qp_max", 42);
+
+    /* ROI disabled by default; cache enabled when ROI active */
+    obs_data_set_default_bool(settings, "roi_enable", false);
+    obs_data_set_default_bool(settings, "roi_cache", true);
 
     /* Lossless disabled by default */
     obs_data_set_default_bool(settings, "lossless", false);
@@ -2328,6 +2489,14 @@ static obs_properties_t *netint_h264_get_properties(void *data)
     obs_properties_add_int(props, "qp", "QP (RC Disabled)", 0, 51, 1);
     obs_properties_add_int(props, "qp_min", "QP Minimum (RC Enabled)", 0, 51, 1);
     obs_properties_add_int(props, "qp_max", "QP Maximum (RC Enabled)", 0, 51, 1);
+
+    obs_property_t *roi_enable = obs_properties_add_bool(props, "roi_enable", "Enable ROI (Region of Interest)");
+    obs_property_set_long_description(roi_enable,
+        "If enabled, OBS ROI regions (from filters or API) are forwarded to the NETINT encoder to bias quality.\n"
+        "Requires libxcoder support for ROI (v3.5+).");
+    obs_property_t *roi_cache = obs_properties_add_bool(props, "roi_cache", "Cache ROI Map in Encoder");
+    obs_property_set_long_description(roi_cache,
+        "When enabled, the encoder reuses the last ROI map if a frame omits ROI metadata (libxcoder cacheRoi=1).");
     
     /* H.264 Profile selection: baseline, main, or high */
     obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -2404,6 +2573,14 @@ static obs_properties_t *netint_h265_get_properties(void *data)
     obs_properties_add_int(props, "qp_min", "QP Minimum (RC Enabled)", 0, 51, 1);
     obs_properties_add_int(props, "qp_max", "QP Maximum (RC Enabled)", 0, 51, 1);
     obs_properties_add_bool(props, "lossless", "Lossless (HEVC only, requires RC Disabled)");
+
+    obs_property_t *roi_enable = obs_properties_add_bool(props, "roi_enable", "Enable ROI (Region of Interest)");
+    obs_property_set_long_description(roi_enable,
+        "If enabled, OBS ROI regions (from filters or API) are forwarded to the NETINT encoder to bias quality.\n"
+        "Requires libxcoder support for ROI (v3.5+).");
+    obs_property_t *roi_cache = obs_properties_add_bool(props, "roi_cache", "Cache ROI Map in Encoder");
+    obs_property_set_long_description(roi_cache,
+        "When enabled, the encoder reuses the last ROI map if a frame omits ROI metadata (libxcoder cacheRoi=1).");
     
     /* H.265 Profile selection: main or main10 ONLY */
     obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -2536,10 +2713,10 @@ static bool netint_get_extra_data(void *data, uint8_t **extra_data, size_t *size
  * 
  * Capability Flags (caps):
  * - OBS_ENCODER_CAP_SCALING: The encoder consumes whatever scaled width/height OBS configured.
+ * - OBS_ENCODER_CAP_ROI: ROI metadata is translated to NETINT ROI maps when supported.
  * - Not advertised:
  *   - OBS_ENCODER_CAP_PASS_TEXTURE (CPU frame ingest only)
  *   - OBS_ENCODER_CAP_DYN_BITRATE (libxcoder lacks live reconfigure path in this integration)
- *   - OBS_ENCODER_CAP_ROI (ROI metadata not yet translated)
  *   - OBS_ENCODER_CAP_INTERNAL / OBS_ENCODER_CAP_DEPRECATED (public, fully supported encoder)
  * 
  * Optional Callbacks (explicitly NULL):
@@ -2555,7 +2732,7 @@ static struct obs_encoder_info netint_h264_info = {
     .id = "obs_netint_t4xx_h264",      /**< Unique identifier for this encoder */
     .codec = "h264",                   /**< Codec string (matches OBS codec type) */
     .type = OBS_ENCODER_VIDEO,        /**< Encoder type: video encoder */
-    .caps = OBS_ENCODER_CAP_SCALING,   /**< Accepts OBS-supplied scaled frames (width/height set per instance) */
+    .caps = OBS_ENCODER_CAP_SCALING | OBS_ENCODER_CAP_ROI,   /**< Accepts scaled frames and supports ROI */
     .get_name = netint_h264_get_name,  /**< Returns "NETINT T4XX H.264" */
     .create = netint_create,
     .destroy = netint_destroy,
@@ -2575,7 +2752,7 @@ static struct obs_encoder_info netint_h265_info = {
     .id = "obs_netint_t4xx_h265",      /**< Unique identifier for this encoder */
     .codec = "hevc",                   /**< Codec string (OBS uses "hevc" for H.265) */
     .type = OBS_ENCODER_VIDEO,        /**< Encoder type: video encoder */
-    .caps = OBS_ENCODER_CAP_SCALING,   /**< Accepts OBS-supplied scaled frames (width/height set per instance) */
+    .caps = OBS_ENCODER_CAP_SCALING | OBS_ENCODER_CAP_ROI,   /**< Accepts scaled frames and supports ROI */
     .get_name = netint_h265_get_name,  /**< Returns "NETINT T4XX H.265" */
     .create = netint_create,
     .destroy = netint_destroy,

@@ -184,12 +184,22 @@ extern void (*p_ni_logan_set_vui)(ni_logan_encoder_params_t *, ni_logan_session_
 /*@}*/
 
 /**
+ * @name Optional Auxiliary Data Helpers
+ * @brief Used to prepare auxiliary (SEI/ROI) data before sending frames
+ */
+/*@{*/
+extern void (*p_ni_logan_enc_prep_aux_data)(ni_logan_session_context_t *, ni_logan_frame_t *, ni_logan_frame_t *, ni_logan_codec_format_t, int, uint8_t *, uint8_t *, uint8_t *, uint8_t *, uint8_t *);
+/*@}*/
+
+/**
  * @name Encoder Parameter Name Constants
  * @brief String constants for encoder parameter names (from ni_device_api_logan.h)
  */
 /*@{*/
 #define NI_LOGAN_ENC_PARAM_GOP_PRESET_IDX                 "gopPresetIdx"
 #define NI_LOGAN_ENC_PARAM_INTRA_PERIOD                   "intraPeriod"
+#define NI_LOGAN_ENC_PARAM_ROI_ENABLE                     "roiEnable"
+#define NI_LOGAN_ENC_PARAM_CACHE_ROI                      "cacheRoi"
 /*@}*/
 
 #endif /* NETINT_LIBXCODER_H */

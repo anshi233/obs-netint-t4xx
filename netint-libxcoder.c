@@ -198,6 +198,7 @@ int (*p_ni_logan_encoder_gop_params_set_value)(ni_logan_encoder_params_t *, cons
 
 /** Set VUI parameters */
 void (*p_ni_logan_set_vui)(ni_logan_encoder_params_t *, ni_logan_session_context_t *, ni_color_primaries_t, ni_color_transfer_characteristic_t, ni_color_space_t, int, int, int, ni_logan_codec_format_t) = NULL;
+void (*p_ni_logan_enc_prep_aux_data)(ni_logan_session_context_t *, ni_logan_frame_t *, ni_logan_frame_t *, ni_logan_codec_format_t, int, uint8_t *, uint8_t *, uint8_t *, uint8_t *, uint8_t *) = NULL;
 /*@}*/
 
 /**
@@ -337,6 +338,10 @@ bool ni_libxcoder_open(void)
     p_ni_logan_encoder_params_set_value = (void *)os_dlsym(s_lib_handle, "ni_logan_encoder_params_set_value");
     RESOLVE(ni_logan_encoder_gop_params_set_value);
     RESOLVE(ni_logan_set_vui);
+    p_ni_logan_enc_prep_aux_data = (void *)os_dlsym(s_lib_handle, "ni_logan_enc_prep_aux_data");
+    if (!p_ni_logan_enc_prep_aux_data) {
+        blog(LOG_WARNING, "[obs-netint-t4xx] ni_logan_enc_prep_aux_data not found - ROI and auxiliary metadata features disabled");
+    }
 
     /* Optional logging API - redirect libxcoder logs to OBS logging */
     p_ni_log_set_callback = (void *)os_dlsym(s_lib_handle, "ni_log_set_callback");

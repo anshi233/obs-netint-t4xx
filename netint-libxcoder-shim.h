@@ -40,6 +40,27 @@
 /** Maximum length of device name string */
 #define NI_LOGAN_MAX_DEVICE_NAME_LEN 32
 
+/** Auxiliary data type identifiers */
+typedef enum {
+    NI_FRAME_AUX_DATA_NONE = 0,
+    NI_FRAME_AUX_DATA_A53_CC = 1,
+    NI_FRAME_AUX_DATA_MASTERING_DISPLAY_METADATA = 2,
+    NI_FRAME_AUX_DATA_CONTENT_LIGHT_LEVEL = 3,
+    NI_FRAME_AUX_DATA_HDR_PLUS = 4,
+    NI_FRAME_AUX_DATA_REGIONS_OF_INTEREST = 5,
+    NI_FRAME_AUX_DATA_UDU_SEI = 6,
+    NI_FRAME_AUX_DATA_CUSTOM_SEI = 7,
+    NI_FRAME_AUX_DATA_BITRATE = 8,
+    NI_FRAME_AUX_DATA_MIN_MAX_QP = 9,
+    NI_FRAME_AUX_DATA_LONG_TERM_REF = 10,
+} ni_aux_data_type_t;
+
+typedef struct _ni_aux_data {
+    ni_aux_data_type_t type;
+    uint8_t *data;
+    int size;
+} ni_aux_data_t;
+
 /** Maximum auxiliary data per frame */
 #define NI_MAX_NUM_AUX_DATA_PER_FRAME 16
 
