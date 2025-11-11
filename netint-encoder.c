@@ -121,6 +121,7 @@ struct netint_frame_job {
  * @brief Minimum number of reusable frame jobs to keep in the pool
  */
 #define NETINT_JOB_POOL_MIN_CAPACITY 20
+#define NETINT_MAX_INTRAPERIOD_FRAMES 1024
 
 /**
  * @brief Minimum number of reusable packet buffers to keep in the pool
@@ -204,7 +205,10 @@ struct netint_ctx {
     int codec_type;                    /**< Codec type: 0 = H.264, 1 = H.265 (HEVC) */
     uint64_t frame_count;              /**< Total frames processed (for start_of_stream logic) */
     int keyint_frames;                 /**< Keyframe interval in frames */
+    int vbv_buffer_ms;                 /**< VBV buffer size in milliseconds (RcInitDelay) */
     int qp_value;                      /**< Constant QP value used when rate control is disabled */
+    int qp_min;                        /**< Minimum QP when rate control enabled */
+    int qp_max;                        /**< Maximum QP when rate control enabled */
     bool lossless;                     /**< Lossless encoding enabled (HEVC only, RC disabled) */
 
     /* Error tracking and health monitoring */
@@ -425,6 +429,13 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     
     /* Get bitrate from settings and convert from kbps to bps (hardware expects bps) */
     ctx->enc.bit_rate = (int64_t)obs_data_get_int(settings, "bitrate") * 1000;
+
+    ctx->vbv_buffer_ms = (int)obs_data_get_int(settings, "vbv_buffer_ms");
+    if (ctx->vbv_buffer_ms < 30) {
+        ctx->vbv_buffer_ms = 30;
+    } else if (ctx->vbv_buffer_ms > 6000) {
+        ctx->vbv_buffer_ms = 6000;
+    }
     
     /* Device selection: try user-specified device first, then auto-discovery */
     const char *dev_name = obs_data_get_string(settings, "device");
@@ -470,6 +481,17 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
     
     /* Convert seconds to frames based on framerate */
     ctx->keyint_frames = (int)(keyint_seconds * (voi->fps_num / (double)voi->fps_den));
+    if (ctx->keyint_frames < 1) {
+        ctx->keyint_frames = (int)(voi->fps_num / (double)voi->fps_den);
+        if (ctx->keyint_frames < 1) {
+            ctx->keyint_frames = 1;
+        }
+    } else if (ctx->keyint_frames > NETINT_MAX_INTRAPERIOD_FRAMES) {
+        blog(LOG_WARNING,
+             "[obs-netint-t4xx] Keyframe interval %.2f sec exceeds hardware intraPeriod limit (%d frames). Clamping.",
+             (double)keyint_seconds, NETINT_MAX_INTRAPERIOD_FRAMES);
+        ctx->keyint_frames = NETINT_MAX_INTRAPERIOD_FRAMES;
+    }
     blog(LOG_INFO, "[obs-netint-t4xx] Keyframe interval: %d seconds = %d frames @ %.2f fps",
          keyint_seconds, ctx->keyint_frames, voi->fps_num / (double)voi->fps_den);
     
@@ -567,6 +589,24 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         ctx->qp_value = 0;
     else if (ctx->qp_value > 51)
         ctx->qp_value = 51;
+
+    ctx->qp_min = (int)obs_data_get_int(settings, "qp_min");
+    if (ctx->qp_min < 0)
+        ctx->qp_min = 0;
+    else if (ctx->qp_min > 51)
+        ctx->qp_min = 51;
+
+    ctx->qp_max = (int)obs_data_get_int(settings, "qp_max");
+    if (ctx->qp_max < 0)
+        ctx->qp_max = 0;
+    else if (ctx->qp_max > 51)
+        ctx->qp_max = 51;
+
+    if (ctx->qp_min > ctx->qp_max) {
+        int tmp = ctx->qp_min;
+        ctx->qp_min = ctx->qp_max;
+        ctx->qp_max = tmp;
+    }
     if (ctx->codec_type == 1) {
         ctx->lossless = obs_data_get_bool(settings, "lossless");
         if (ctx->lossless && (!ctx->rc_mode || strcmp(ctx->rc_mode, "DISABLED") != 0)) {
@@ -708,6 +748,18 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
         }
         blog(LOG_INFO, "[obs-netint-t4xx] GOP set to %s", gop_desc);
 
+        if (ctx->keyint_frames > 0) {
+            char intraperiod_str[32];
+            snprintf(intraperiod_str, sizeof(intraperiod_str), "%d", ctx->keyint_frames);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "intraPeriod", intraperiod_str)) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set intraPeriod to %d frames", ctx->keyint_frames);
+                goto fail;
+            }
+            blog(LOG_INFO, "[obs-netint-t4xx] intraPeriod set to %d frames", ctx->keyint_frames);
+        } else {
+            blog(LOG_WARNING, "[obs-netint-t4xx] Computed keyframe interval <= 0; skipping intraPeriod configuration");
+        }
+
         const bool rc_disabled = (ctx->rc_mode && strcmp(ctx->rc_mode, "DISABLED") == 0);
 
         if (rc_disabled) {
@@ -780,11 +832,24 @@ static void *netint_create(obs_data_t *settings, obs_encoder_t *encoder)
                  ctx->enc.timebase_den, ctx->enc.timebase_num,
                  ctx->enc.timebase_den / (double)ctx->enc.timebase_num);
             
-            if (!netint_set_encoder_param(ctx, params, session_ctx, "RcInitDelay", "3000")) {
-                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set VBV buffer size (RcInitDelay)");
+            char vbv_str[32];
+            snprintf(vbv_str, sizeof(vbv_str), "%d", ctx->vbv_buffer_ms);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "RcInitDelay", vbv_str)) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to set VBV buffer size (RcInitDelay=%s)", vbv_str);
                 goto fail;
             }
-            blog(LOG_INFO, "[obs-netint-t4xx] VBV buffer size (RCInitDelay) set to 3000 ms");
+            blog(LOG_INFO, "[obs-netint-t4xx] VBV buffer size (RcInitDelay) set to %d ms", ctx->vbv_buffer_ms);
+
+            char qp_min_str[16];
+            char qp_max_str[16];
+            snprintf(qp_min_str, sizeof(qp_min_str), "%d", ctx->qp_min);
+            snprintf(qp_max_str, sizeof(qp_max_str), "%d", ctx->qp_max);
+            if (!netint_set_encoder_param(ctx, params, session_ctx, "minQp", qp_min_str) ||
+                !netint_set_encoder_param(ctx, params, session_ctx, "maxQp", qp_max_str)) {
+                blog(LOG_ERROR, "[obs-netint-t4xx] Failed to apply QP clamp range (%d-%d)", ctx->qp_min, ctx->qp_max);
+                goto fail;
+            }
+            blog(LOG_INFO, "[obs-netint-t4xx] QP clamp range set to [%d, %d]", ctx->qp_min, ctx->qp_max);
 
             /* Set rate control mode: CBR (constant) or VBR (variable) */
             /* CBR = constant bitrate (good for streaming), VBR = variable bitrate (better quality) */
@@ -2164,11 +2229,18 @@ static void netint_h264_get_defaults(obs_data_t *settings)
     /* Default keyframe interval: 2 seconds (auto-calculated from FPS if <= 0) */
     obs_data_set_default_int(settings, "keyint", 2);
     
+    /* Default VBV buffer size: 3000 ms (3-second buffer gives smoother RC) */
+    obs_data_set_default_int(settings, "vbv_buffer_ms", 3000);
+
     /* Default rate control: CBR (constant bitrate) - better for streaming */
     obs_data_set_default_string(settings, "rc_mode", "CBR");
 
     /* Default QP when rate control is disabled */
     obs_data_set_default_int(settings, "qp", 22);
+
+    /* Default QP limits when rate control is enabled */
+    obs_data_set_default_int(settings, "qp_min", 18);
+    obs_data_set_default_int(settings, "qp_max", 42);
 
     /* Lossless disabled by default */
     obs_data_set_default_bool(settings, "lossless", false);
@@ -2195,11 +2267,18 @@ static void netint_h265_get_defaults(obs_data_t *settings)
     /* Default keyframe interval: 2 seconds (auto-calculated from FPS if <= 0) */
     obs_data_set_default_int(settings, "keyint", 2);
     
+    /* Default VBV buffer size: 3000 ms (3-second buffer gives smoother RC) */
+    obs_data_set_default_int(settings, "vbv_buffer_ms", 3000);
+
     /* Default rate control: CBR (constant bitrate) - better for streaming */
     obs_data_set_default_string(settings, "rc_mode", "CBR");
 
     /* Default QP when rate control is disabled */
     obs_data_set_default_int(settings, "qp", 22);
+
+    /* Default QP limits when rate control is enabled */
+    obs_data_set_default_int(settings, "qp_min", 18);
+    obs_data_set_default_int(settings, "qp_max", 42);
 
     /* Lossless disabled by default */
     obs_data_set_default_bool(settings, "lossless", false);
@@ -2230,6 +2309,12 @@ static obs_properties_t *netint_h264_get_properties(void *data)
     
     /* Keyframe interval: 1-20 seconds, step size 1 second */
     obs_properties_add_int(props, "keyint", "Keyframe Interval (s)", 1, 20, 1);
+
+    /* VBV buffer size: 30-6000 ms (3s default) */
+    obs_property_t *vbv = obs_properties_add_int(props, "vbv_buffer_ms", "VBV Buffer (ms)", 30, 6000, 10);
+    obs_property_set_long_description(vbv,
+        "Sets the rate control VBV buffer size in milliseconds (RcInitDelay). Larger buffers improve quality.\n"
+        "Range: 30-6000 ms. Default: 3000 ms.");
     
     /* Device name: text input (will be converted to dropdown if discovery works) */
     obs_properties_add_text(props, "device", "Device Name (optional)", OBS_TEXT_DEFAULT);
@@ -2241,6 +2326,8 @@ static obs_properties_t *netint_h264_get_properties(void *data)
     obs_property_list_add_string(rc, "Disabled (Constant QP)", "DISABLED");
 
     obs_properties_add_int(props, "qp", "QP (RC Disabled)", 0, 51, 1);
+    obs_properties_add_int(props, "qp_min", "QP Minimum (RC Enabled)", 0, 51, 1);
+    obs_properties_add_int(props, "qp_max", "QP Maximum (RC Enabled)", 0, 51, 1);
     
     /* H.264 Profile selection: baseline, main, or high */
     obs_property_t *prof = obs_properties_add_list(props, "profile", "Profile", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -2297,6 +2384,12 @@ static obs_properties_t *netint_h265_get_properties(void *data)
     
     /* Keyframe interval: 1-20 seconds, step size 1 second */
     obs_properties_add_int(props, "keyint", "Keyframe Interval (s)", 1, 20, 1);
+
+    /* VBV buffer size: 30-6000 ms (3s default) */
+    obs_property_t *vbv = obs_properties_add_int(props, "vbv_buffer_ms", "VBV Buffer (ms)", 30, 6000, 10);
+    obs_property_set_long_description(vbv,
+        "Sets the rate control VBV buffer size in milliseconds (RcInitDelay). Larger buffers improve quality.\n"
+        "Range: 30-6000 ms. Default: 3000 ms.");
     
     /* Device name: text input (will be converted to dropdown if discovery works) */
     obs_properties_add_text(props, "device", "Device Name (optional)", OBS_TEXT_DEFAULT);
@@ -2308,6 +2401,8 @@ static obs_properties_t *netint_h265_get_properties(void *data)
     obs_property_list_add_string(rc, "Disabled (Constant QP)", "DISABLED");
 
     obs_properties_add_int(props, "qp", "QP (RC Disabled)", 0, 51, 1);
+    obs_properties_add_int(props, "qp_min", "QP Minimum (RC Enabled)", 0, 51, 1);
+    obs_properties_add_int(props, "qp_max", "QP Maximum (RC Enabled)", 0, 51, 1);
     obs_properties_add_bool(props, "lossless", "Lossless (HEVC only, requires RC Disabled)");
     
     /* H.265 Profile selection: main or main10 ONLY */
